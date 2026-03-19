@@ -321,6 +321,41 @@ function shell({ title, body }) {
           gap: 12px;
           margin-top: 18px;
         }
+        .modal-backdrop {
+          position: fixed;
+          inset: 0;
+          background: rgba(18, 35, 30, .48);
+          display: none;
+          align-items: center;
+          justify-content: center;
+          padding: 20px;
+          z-index: 50;
+        }
+        .modal-backdrop.open {
+          display: flex;
+        }
+        .modal {
+          width: min(460px, 100%);
+          background: #fff;
+          border-radius: 24px;
+          border: 1px solid var(--line);
+          box-shadow: 0 22px 60px rgba(13, 40, 32, .22);
+          padding: 24px;
+        }
+        .modal h3 {
+          margin: 0 0 12px;
+          font-size: 24px;
+        }
+        .modal p {
+          margin: 0;
+          color: var(--muted);
+        }
+        .modal-actions {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 12px;
+          margin-top: 20px;
+        }
         .split {
           display: grid;
           grid-template-columns: repeat(2, minmax(0, 1fr));

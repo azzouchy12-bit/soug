@@ -432,17 +432,29 @@ async function buildOverviewBody(state) {
 function buildTimingBody(state) {
   const schedule = getScheduleSettings(state);
   return `
-    ${renderFormSection({
-      title: "التحكم في وقت النشر",
-      icon: icons.clock,
-      action: "/dashboard/timing",
-      fields: [
-        renderField({ label: "الفاصل بين المنشورات بالدقائق", name: "intervalMinutes", type: "number", min: "1", max: "1440", value: schedule.intervalMinutes }),
-        renderField({ label: "تشغيل النشر التلقائي", name: "scheduleEnabled", type: "checkbox", checked: schedule.enabled })
-      ],
-      actions: ['<button class="btn btn-primary" type="submit">حفظ الوقت</button>'],
-      helper: "بعد الحفظ سيتم تحديث المؤقت فورًا دون الحاجة إلى إعادة تشغيل التطبيق."
-    })}
+    <section class="section">
+      <h2>${icons.clock}<span>التحكم في وقت النشر</span></h2>
+      <form id="timingForm" method="post" action="/dashboard/timing">
+        <div class="stack">
+          ${renderField({ label: "الفاصل بين المنشورات بالدقائق", name: "intervalMinutes", type: "number", min: "1", max: "1440", value: schedule.intervalMinutes })}
+          ${renderField({ label: "تشغيل النشر التلقائي", name: "scheduleEnabled", type: "checkbox", checked: schedule.enabled })}
+        </div>
+        <div class="helper">بعد الحفظ سيتم تحديث المؤقت فورًا دون الحاجة إلى إعادة تشغيل التطبيق.</div>
+        <div class="actions">
+          <button class="btn btn-primary" type="button" id="openTimingConfirm">حفظ الوقت</button>
+        </div>
+      </form>
+    </section>
+    <div class="modal-backdrop" id="timingConfirmModal" aria-hidden="true">
+      <div class="modal">
+        <h3>تأكيد تغيير الوقت</h3>
+        <p>هل أنت متأكد من تغيير وقت النشر؟ بعد الضغط على تأكيد سيتم حفظ الوقت الجديد مباشرة.</p>
+        <div class="modal-actions">
+          <button class="btn btn-primary" type="button" id="confirmTimingSave">تأكيد</button>
+          <button class="btn btn-secondary" type="button" id="cancelTimingSave">إلغاء</button>
+        </div>
+      </div>
+    </div>
     <section class="section">
       <h2>${icons.clock}<span>ملخص الوقت</span></h2>
       ${renderMetrics([
@@ -452,6 +464,38 @@ function buildTimingBody(state) {
         { label: "الموعد القادم", value: computeNextRunText(state), icon: icons.spark }
       ])}
     </section>
+    <script>
+      (() => {
+        const form = document.getElementById("timingForm");
+        const modal = document.getElementById("timingConfirmModal");
+        const openButton = document.getElementById("openTimingConfirm");
+        const confirmButton = document.getElementById("confirmTimingSave");
+        const cancelButton = document.getElementById("cancelTimingSave");
+
+        if (!form || !modal || !openButton || !confirmButton || !cancelButton) {
+          return;
+        }
+
+        const openModal = () => {
+          modal.classList.add("open");
+          modal.setAttribute("aria-hidden", "false");
+        };
+
+        const closeModal = () => {
+          modal.classList.remove("open");
+          modal.setAttribute("aria-hidden", "true");
+        };
+
+        openButton.addEventListener("click", openModal);
+        cancelButton.addEventListener("click", closeModal);
+        confirmButton.addEventListener("click", () => form.submit());
+        modal.addEventListener("click", (event) => {
+          if (event.target === modal) {
+            closeModal();
+          }
+        });
+      })();
+    </script>
   `;
 }
 
