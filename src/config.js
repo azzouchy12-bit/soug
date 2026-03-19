@@ -42,6 +42,7 @@ export const config = {
   facebookAppId: process.env.FB_APP_ID || "",
   facebookAppSecret: process.env.FB_APP_SECRET || "",
   facebookPageId: process.env.FB_PAGE_ID || "",
+  facebookPageAccessToken: process.env.FB_PAGE_ACCESS_TOKEN || "",
   contentLanguage: process.env.CONTENT_LANGUAGE || "Arabic",
   contentBrief:
     process.env.CONTENT_BRIEF ||
@@ -64,16 +65,18 @@ export function getMissingCoreConfig() {
     missing.push("GEMINI_API_KEY");
   }
 
-  if (!config.facebookAppId) {
-    missing.push("FB_APP_ID");
-  }
-
-  if (!config.facebookAppSecret) {
-    missing.push("FB_APP_SECRET");
-  }
-
   if (!config.facebookPageId) {
     missing.push("FB_PAGE_ID");
+  }
+
+  if (!config.facebookPageAccessToken) {
+    if (!config.facebookAppId) {
+      missing.push("FB_APP_ID");
+    }
+
+    if (!config.facebookAppSecret) {
+      missing.push("FB_APP_SECRET");
+    }
   }
 
   return missing;

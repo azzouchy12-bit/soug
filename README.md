@@ -40,6 +40,7 @@ copy .env.example .env
 - `FB_APP_ID`
 - `FB_APP_SECRET`
 - `FB_PAGE_ID`
+- `FB_PAGE_ACCESS_TOKEN` إذا أردت التشغيل المباشر دون ربط الصفحة
 - `CONTENT_LANGUAGE`
 - `CONTENT_BRIEF`
 - `POST_INTERVAL_MINUTES`
@@ -62,6 +63,8 @@ npm start
 http://localhost:3000
 ```
 
+إذا وضعت `FB_PAGE_ACCESS_TOKEN` مع `FB_PAGE_ID` فسيبدأ البوت بالنشر مباشرة بعد التشغيل، دون الحاجة إلى تنفيذ Facebook Login أولًا.
+
 ## 3. الدخول إلى الداشبورد
 
 - افتح `/login`
@@ -80,6 +83,12 @@ http://localhost:3000
 3. سجل الدخول عبر Facebook Login
 4. امنح الصلاحيات المطلوبة
 5. إذا كان الحساب يدير الصفحة المطابقة لـ `FB_PAGE_ID` فسيتم ربطها تلقائيًا
+
+إذا كنت تستخدم `FB_PAGE_ACCESS_TOKEN`:
+
+1. لا تحتاج هذا القسم أصلًا
+2. شغّل البوت فقط
+3. سيستخدم الصفحة المحددة في `FB_PAGE_ID` مباشرة
 
 ## 5. تجربة النشر
 
@@ -102,6 +111,7 @@ http://localhost:3000/run-once
 - التوكنات تُحفظ محليًا داخل `data/state.json`
 - لا تضع هذا الملف في Git
 - إذا انتهت صلاحية الربط، أعد تسجيل الدخول من `/auth/facebook/start`
+- إذا وضعت `FB_PAGE_ACCESS_TOKEN` فلن تحتاج إلى ربط الصفحة من الداشبورد
 - هذا الإصدار مقفول على الصفحة الموجودة في `FB_PAGE_ID` فقط، ولن يسمح باختيار صفحة أخرى
 - يمكنك تغيير وقت النشر من الداشبورد دون تعديل المتغيرات ودون إعادة تشغيل التطبيق
 - عدل `CONTENT_BRIEF` ليصبح المحتوى مناسبًا لمجالك بدل المنشورات العامة
@@ -132,9 +142,9 @@ git push -u origin main
 2. في Railway اختر `New Project` ثم `Deploy from GitHub Repo`
 3. أضف متغيرات البيئة:
    - `AI_PROVIDER=gemini`
-   - `FB_APP_ID`
-   - `FB_APP_SECRET`
    - `FB_PAGE_ID` إجباري
+   - `FB_PAGE_ACCESS_TOKEN` إذا أردت الوضع المباشر
+   - `FB_APP_ID` و `FB_APP_SECRET` فقط إذا كنت تريد Facebook Login بدل التوكن المباشر
    - `CONTENT_LANGUAGE`
    - `CONTENT_BRIEF`
    - `POST_INTERVAL_MINUTES`

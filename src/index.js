@@ -216,15 +216,42 @@ function getScheduleSettings(state = readState()) {
   };
 }
 
+function hasDirectPageAccessToken() {
+  return Boolean(config.facebookPageAccessToken);
+}
+
+function getResolvedPageConnection(state = readState()) {
+  if (hasDirectPageAccessToken()) {
+    return {
+      pageId: config.facebookPageId,
+      pageAccessToken: config.facebookPageAccessToken,
+      pageName:
+        state.facebook.pageId === config.facebookPageId && state.facebook.pageName
+          ? state.facebook.pageName
+          : "Configured Facebook Page",
+      mode: "direct"
+    };
+  }
+
+  const hasMatchingPageToken = state.facebook.pageId === config.facebookPageId;
+
+  return {
+    pageId: config.facebookPageId,
+    pageAccessToken: hasMatchingPageToken ? state.facebook.pageAccessToken : "",
+    pageName: hasMatchingPageToken ? state.facebook.pageName || "My Facebook Page" : "My Facebook Page",
+    mode: "oauth"
+  };
+}
+
 async function runPostingJob() {
   const state = readState();
-  const pageId = config.facebookPageId;
-  const hasMatchingPageToken = state.facebook.pageId === config.facebookPageId;
-  const pageAccessToken = hasMatchingPageToken ? state.facebook.pageAccessToken : "";
-  const pageName = hasMatchingPageToken ? state.facebook.pageName || "My Facebook Page" : "My Facebook Page";
+  const connection = getResolvedPageConnection(state);
+  const pageId = connection.pageId;
+  const pageAccessToken = connection.pageAccessToken;
+  const pageName = connection.pageName;
 
   if (!pageId || !pageAccessToken) {
-    throw new Error("The configured FB_PAGE_ID is not connected yet. Reconnect Facebook for this page.");
+    throw new Error("The configured FB_PAGE_ID is not connected yet. Add FB_PAGE_ACCESS_TOKEN or reconnect Facebook for this page.");
   }
 
   const message = await generatePost({
@@ -691,8 +718,9 @@ function renderDashboard({ req, state, notice = "", error = "" }) {
   const missing = getMissingCoreConfig();
   const schedule = getScheduleSettings(state);
   const schedulerSnapshot = getSchedulerSnapshot();
-  const connectedConfiguredPage =
-    state.facebook.pageId === config.facebookPageId ? state.facebook.pageName : "";
+  const pageConnection = getResolvedPageConnection(state);
+  const isDirectMode = pageConnection.mode === "direct";
+  const connectedConfiguredPage = pageConnection.pageAccessToken ? pageConnection.pageName : "";
   const recentPosts = state.posts.slice(-6).reverse();
   const statusTone = getStatusTone(
     schedulerIsActive() && schedule.enabled,
@@ -710,10 +738,14 @@ function renderDashboard({ req, state, notice = "", error = "" }) {
             <div>
               <div class="eyebrow">${icons.spark}<span>Gemini + Facebook Page Automation</span></div>
               <h1>لوحة تحكم النشر التلقائي</h1>
-              <p>هذه اللوحة مقفولة على صفحتك فقط عبر <strong>FB_PAGE_ID</strong>، وتمنحك تحكمًا مباشرًا في وقت النشر، ربط الصفحة، وتشغيل منشور فوري عند الحاجة.</p>
+              <p>هذه اللوحة مقفولة على صفحتك فقط عبر <strong>FB_PAGE_ID</strong>، وتمنحك تحكمًا مباشرًا في وقت النشر وتشغيل منشور فوري عند الحاجة${isDirectMode ? " من دون خطوة ربط الصفحة." : " مع إمكانية ربط الصفحة عند الحاجة."}</p>
             </div>
             <div class="toolbar">
-              <a class="btn btn-ghost" href="/auth/facebook/start">${icons.link}<span>ربط الصفحة</span></a>
+              ${
+                isDirectMode
+                  ? `<span class="btn btn-ghost">${icons.page}<span>وضع مباشر مفعل</span></span>`
+                  : `<a class="btn btn-ghost" href="/auth/facebook/start">${icons.link}<span>ربط الصفحة</span></a>`
+              }
               <a class="btn btn-ghost" href="/status">${icons.status}<span>JSON</span></a>
               <form method="post" action="/logout">
                 <button class="btn btn-ghost" type="submit">${icons.logout}<span>خروج</span></button>
@@ -753,8 +785,8 @@ function renderDashboard({ req, state, notice = "", error = "" }) {
               </div>
               <div class="metric">
                 <div class="metric-label">${icons.page}<span>الصفحة المستهدفة</span></div>
-                <div class="metric-value">${escapeHtml(connectedConfiguredPage || "غير مربوطة بعد")}</div>
-                <div class="metric-note">FB_PAGE_ID: ${escapeHtml(config.facebookPageId || "غير مضبوط")}</div>
+                <div class="metric-value">${escapeHtml(connectedConfiguredPage || (isDirectMode ? "جاهزة عبر التوكن المباشر" : "غير مربوطة بعد"))}</div>
+                <div class="metric-note">FB_PAGE_ID: ${escapeHtml(config.facebookPageId || "غير مضبوط")} | ${isDirectMode ? "Direct Token" : "OAuth"}</div>
               </div>
               <div class="metric">
                 <div class="metric-label">${icons.spark}<span>الذكاء الاصطناعي</span></div>
@@ -766,12 +798,12 @@ function renderDashboard({ req, state, notice = "", error = "" }) {
 
           <article class="card span-5">
             <h2 class="card-title">${icons.shield}<span>الدخول والحماية</span></h2>
-            <p class="muted">الدخول إلى هذه اللوحة محمي بكود ثابت، والعمليات الحساسة مثل ربط الصفحة والنشر اليدوي لا تعمل إلا بعد فتح الداشبورد.</p>
+            <p class="muted">الدخول إلى هذه اللوحة محمي بكود ثابت، والعمليات الحساسة مثل النشر اليدوي وتعديل الوقت لا تعمل إلا بعد فتح الداشبورد.</p>
             <div class="metric-grid">
               <div class="metric">
                 <div class="metric-label">${icons.link}<span>الرابط الحالي</span></div>
                 <div class="metric-value">${escapeHtml(currentHost)}</div>
-                <div class="metric-note">Callback: ${escapeHtml(`${config.baseUrl}/auth/facebook/callback`)}</div>
+                <div class="metric-note">${isDirectMode ? "البوت سيعمل مباشرة عند التشغيل" : `Callback: ${escapeHtml(`${config.baseUrl}/auth/facebook/callback`)}`}</div>
               </div>
               <div class="metric">
                 <div class="metric-label">${icons.page}<span>هوية الصفحة</span></div>
@@ -801,12 +833,17 @@ function renderDashboard({ req, state, notice = "", error = "" }) {
           </article>
 
           <article class="card span-4">
-            <h2 class="card-title">${icons.link}<span>ربط الصفحة</span></h2>
-            <p class="muted">بعد الضغط على الربط، سيقبل التطبيق فقط الصفحة التي يطابق معرفها قيمة <code>FB_PAGE_ID</code> داخل إعدادات Railway.</p>
-            <div class="inline-actions">
-              <a class="btn btn-secondary" href="/auth/facebook/start">${icons.link}<span>إعادة ربط Facebook</span></a>
-            </div>
-            <p class="muted">آخر ربط: ${escapeHtml(state.facebook.lastAuthAt || "لم يتم بعد")}</p>
+            <h2 class="card-title">${icons.link}<span>${isDirectMode ? "الوضع المباشر" : "ربط الصفحة"}</span></h2>
+            <p class="muted">${
+              isDirectMode
+                ? "بوجود FB_PAGE_ACCESS_TOKEN لن تحتاج إلى ربط Facebook من الداشبورد. يكفي تشغيل البوت وسيستخدم التوكن المباشر للنشر على صفحتك."
+                : "بعد الضغط على الربط، سيقبل التطبيق فقط الصفحة التي يطابق معرفها قيمة FB_PAGE_ID داخل إعدادات Railway."
+            }</p>
+            ${
+              isDirectMode
+                ? `<p class="muted">التوكن المباشر مفعل الآن، وآخر ربط محفوظ: ${escapeHtml(state.facebook.lastAuthAt || "غير مطلوب في هذا الوضع")}</p>`
+                : `<div class="inline-actions"><a class="btn btn-secondary" href="/auth/facebook/start">${icons.link}<span>إعادة ربط Facebook</span></a></div><p class="muted">آخر ربط: ${escapeHtml(state.facebook.lastAuthAt || "لم يتم بعد")}</p>`
+            }
           </article>
 
           <article class="card span-4">
@@ -920,6 +957,7 @@ app.get("/status", ensureDashboardAuth, (req, res) => {
   const state = readState();
   const schedule = getScheduleSettings(state);
   const missing = getMissingCoreConfig();
+  const pageConnection = getResolvedPageConnection(state);
 
   res.json({
     ok: true,
@@ -928,15 +966,16 @@ app.get("/status", ensureDashboardAuth, (req, res) => {
     aiProvider: config.aiProvider,
     aiModel: getActiveAiModel(),
     configuredPageId: config.facebookPageId,
+    directPageTokenConfigured: hasDirectPageAccessToken(),
     schedule,
     scheduler: getSchedulerSnapshot(),
-    connectedPage:
-      state.facebook.pageId === config.facebookPageId
-        ? {
-            id: state.facebook.pageId,
-            name: state.facebook.pageName
-          }
-        : null,
+    connectedPage: pageConnection.pageAccessToken
+      ? {
+          id: config.facebookPageId,
+          name: pageConnection.pageName,
+          mode: pageConnection.mode
+        }
+      : null,
     missingEnv: missing,
     lastRunAt: state.scheduler.lastRunAt,
     lastResult: state.scheduler.lastResult,
@@ -972,6 +1011,13 @@ app.post("/settings/schedule", ensureDashboardAuth, (req, res) => {
 });
 
 app.get("/auth/facebook/start", ensureDashboardAuth, (req, res) => {
+  if (hasDirectPageAccessToken()) {
+    redirectWithMessage(res, "/", {
+      notice: "الوضع المباشر مفعل بالفعل عبر FB_PAGE_ACCESS_TOKEN."
+    });
+    return;
+  }
+
   const missing = getMissingCoreConfig();
   if (missing.length) {
     res.status(400).send(`Missing env values: ${missing.join(", ")}`);
@@ -982,6 +1028,13 @@ app.get("/auth/facebook/start", ensureDashboardAuth, (req, res) => {
 });
 
 app.get("/auth/facebook/callback", ensureDashboardAuth, async (req, res) => {
+  if (hasDirectPageAccessToken()) {
+    redirectWithMessage(res, "/", {
+      notice: "تم تجاوز Facebook Login لأن FB_PAGE_ACCESS_TOKEN مفعل."
+    });
+    return;
+  }
+
   try {
     const code = req.query.code;
     if (!code) {
@@ -1026,6 +1079,34 @@ app.get("/auth/facebook/callback", ensureDashboardAuth, async (req, res) => {
   }
 });
 
+async function maybeRunStartupPost() {
+  const state = readState();
+  const schedule = getScheduleSettings(state);
+
+  if (!hasDirectPageAccessToken() || !schedule.enabled || getMissingCoreConfig().length) {
+    return;
+  }
+
+  const lastRunAt = state.scheduler.lastRunAt ? new Date(state.scheduler.lastRunAt).getTime() : 0;
+  const minDelayMs = schedule.intervalMinutes * 60 * 1000;
+
+  if (lastRunAt && Number.isFinite(lastRunAt) && Date.now() - lastRunAt < minDelayMs) {
+    return;
+  }
+
+  try {
+    await runPostingJob();
+    console.log("[startup] initial post published using direct page token");
+  } catch (error) {
+    updateState((current) => {
+      current.scheduler.lastRunAt = new Date().toISOString();
+      current.scheduler.lastError = error.message;
+      return current;
+    });
+    console.error("[startup] failed:", error.message);
+  }
+}
+
 app.get("/run-once", ensureDashboardAuth, async (req, res) => {
   try {
     const result = await runPostingJob();
@@ -1052,4 +1133,8 @@ app.listen(config.port, () => {
   console.log(`Public base URL ${config.baseUrl}`);
   console.log(`Dashboard code protected on /login`);
   console.log(`Scheduler active: ${schedule.enabled ? "yes" : "no"}`);
+  if (hasDirectPageAccessToken()) {
+    console.log(`Direct page token mode enabled for page ${config.facebookPageId}`);
+    void maybeRunStartupPost();
+  }
 });
