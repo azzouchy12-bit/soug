@@ -25,12 +25,13 @@ function escapeHtml(value) {
 
 async function runPostingJob() {
   const state = readState();
-  const pageId = state.facebook.pageId || config.facebookPageId;
-  const pageAccessToken = state.facebook.pageAccessToken;
-  const pageName = state.facebook.pageName || "My Facebook Page";
+  const pageId = config.facebookPageId;
+  const hasMatchingPageToken = state.facebook.pageId === config.facebookPageId;
+  const pageAccessToken = hasMatchingPageToken ? state.facebook.pageAccessToken : "";
+  const pageName = hasMatchingPageToken ? state.facebook.pageName || "My Facebook Page" : "My Facebook Page";
 
   if (!pageId || !pageAccessToken) {
-    throw new Error("Facebook Page is not connected yet.");
+    throw new Error("The configured FB_PAGE_ID is not connected yet. Reconnect Facebook for this page.");
   }
 
   const message = await generatePost({
@@ -77,31 +78,11 @@ const cronExpression = startScheduler(async () => {
   }
 });
 
-function renderPageSelection(pages) {
-  const items = pages
-    .map((page) => {
-      return `<li><a href="/select-page?pageId=${encodeURIComponent(page.id)}">${escapeHtml(page.name)}</a></li>`;
-    })
-    .join("");
-
-  return `<!doctype html>
-  <html lang="ar">
-    <head>
-      <meta charset="utf-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1" />
-      <title>اختر الصفحة</title>
-    </head>
-    <body style="font-family:Tahoma,Arial,sans-serif;max-width:760px;margin:40px auto;line-height:1.7">
-      <h1>اختر الصفحة التي تريد النشر عليها</h1>
-      <ul>${items}</ul>
-      <p><a href="/">العودة إلى الصفحة الرئيسية</a></p>
-    </body>
-  </html>`;
-}
-
 app.get("/", (req, res) => {
   const state = readState();
   const missing = getMissingCoreConfig();
+  const connectedConfiguredPage =
+    state.facebook.pageId === config.facebookPageId ? state.facebook.pageName : "";
   const recentPosts = state.posts
     .slice(-5)
     .reverse()
@@ -117,7 +98,7 @@ app.get("/", (req, res) => {
     </head>
     <body style="font-family:Tahoma,Arial,sans-serif;max-width:860px;margin:40px auto;line-height:1.7">
       <h1>بوت النشر التلقائي بالذكاء الاصطناعي لصفحتك</h1>
-      <p>هذا المشروع ينشر تلقائيًا إلى <strong>Facebook Page</strong> كل ${config.postIntervalMinutes} دقائق باستخدام OpenAI و Meta Graph API.</p>
+      <p>هذا المشروع ينشر تلقائيًا إلى <strong>Facebook Page</strong> كل ${config.postIntervalMinutes} دقائق باستخدام Gemini و Meta Graph API.</p>
 
       <h2>الحالة</h2>
       <ul>
@@ -126,7 +107,8 @@ app.get("/", (req, res) => {
         <li>الرابط العام: ${escapeHtml(config.baseUrl)}</li>
         <li>مزود الذكاء الاصطناعي: ${escapeHtml(config.aiProvider)}</li>
         <li>الموديل: ${escapeHtml(getActiveAiModel())}</li>
-        <li>الصفحة المختارة: ${escapeHtml(state.facebook.pageName || "غير محددة بعد")}</li>
+        <li>FB_PAGE_ID المحدد: ${escapeHtml(config.facebookPageId || "غير مضبوط")}</li>
+        <li>الصفحة المربوطة: ${escapeHtml(connectedConfiguredPage || "غير مربوطة بعد")}</li>
         <li>آخر تشغيل: ${escapeHtml(state.scheduler.lastRunAt || "لم يتم بعد")}</li>
         <li>آخر نتيجة: ${escapeHtml(state.scheduler.lastResult || "لا توجد")}</li>
         <li>آخر خطأ: ${escapeHtml(state.scheduler.lastError || "لا يوجد")}</li>
@@ -138,7 +120,8 @@ app.get("/", (req, res) => {
           ? `<p>المتغيرات الناقصة في <code>.env</code>: ${escapeHtml(missing.join(", "))}</p>`
           : `<p>تم تحميل المتغيرات الأساسية.</p>`
       }
-      <p><a href="/auth/facebook/start">ربط حساب فيسبوك واختيار صفحة</a></p>
+      <p>لن يتم استخدام أي صفحة أخرى غير الصفحة المحددة في <code>FB_PAGE_ID</code>.</p>
+      <p><a href="/auth/facebook/start">ربط حساب فيسبوك وربط الصفحة المحددة فقط</a></p>
       <p><a href="/run-once">نشر منشور تجريبي الآن</a></p>
       <p><a href="/status">عرض الحالة كـ JSON</a></p>
 
@@ -165,8 +148,9 @@ app.get("/status", (req, res) => {
     stateDir: config.stateDir,
     aiProvider: config.aiProvider,
     aiModel: getActiveAiModel(),
+    configuredPageId: config.facebookPageId,
     schedulerActive: schedulerIsActive(),
-    connectedPage: state.facebook.pageId
+    connectedPage: state.facebook.pageId === config.facebookPageId
       ? {
           id: state.facebook.pageId,
           name: state.facebook.pageName
@@ -207,53 +191,29 @@ app.get("/auth/facebook/callback", async (req, res) => {
       throw new Error("No managed Facebook Pages were found for this account.");
     }
 
-    const matchingPage =
-      pages.find((page) => page.id === config.facebookPageId) ||
-      (pages.length === 1 ? pages[0] : null);
+    const matchingPage = pages.find((page) => page.id === config.facebookPageId);
+
+    if (!matchingPage) {
+      throw new Error(
+        `The configured FB_PAGE_ID (${config.facebookPageId}) is not managed by this Facebook account.`
+      );
+    }
 
     updateState((current) => {
       current.facebook.userAccessToken = userAccessToken;
-      current.facebook.pages = pages;
+      current.facebook.pages = [matchingPage];
       current.facebook.lastAuthAt = new Date().toISOString();
-
-      if (matchingPage) {
-        current.facebook.pageId = matchingPage.id;
-        current.facebook.pageName = matchingPage.name;
-        current.facebook.pageAccessToken = matchingPage.access_token;
-      }
+      current.facebook.pageId = matchingPage.id;
+      current.facebook.pageName = matchingPage.name;
+      current.facebook.pageAccessToken = matchingPage.access_token;
 
       return current;
     });
-
-    if (!matchingPage) {
-      res.type("html").send(renderPageSelection(pages));
-      return;
-    }
 
     res.redirect("/");
   } catch (error) {
     res.status(500).send(`Facebook auth failed: ${error.message}`);
   }
-});
-
-app.get("/select-page", (req, res) => {
-  const pageId = String(req.query.pageId || "");
-  const state = readState();
-  const selectedPage = state.facebook.pages.find((page) => page.id === pageId);
-
-  if (!selectedPage) {
-    res.status(404).send("Page not found in the authenticated account.");
-    return;
-  }
-
-  updateState((current) => {
-    current.facebook.pageId = selectedPage.id;
-    current.facebook.pageName = selectedPage.name;
-    current.facebook.pageAccessToken = selectedPage.access_token;
-    return current;
-  });
-
-  res.redirect("/");
 });
 
 app.get("/run-once", async (req, res) => {

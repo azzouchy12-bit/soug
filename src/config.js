@@ -71,5 +71,9 @@ export function getMissingCoreConfig() {
     missing.push("FB_APP_SECRET");
   }
 
+  if (!config.facebookPageId) {
+    missing.push("FB_PAGE_ID");
+  }
+
   return missing;
 }
