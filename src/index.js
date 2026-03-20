@@ -215,6 +215,17 @@ function getMarketImageUrl(state = readState()) {
   return market.imageFilename ? `/uploads/${encodeURIComponent(market.imageFilename)}` : "";
 }
 
+function getLatestKnownMarketPost(state = readState()) {
+  const market = getMarketState(state);
+  const latestPost = Array.isArray(state.posts) && state.posts.length ? state.posts[state.posts.length - 1] : null;
+  const inferredNumber = latestPost?.marketNumber || extractMarketNumberFromMessage(latestPost?.message || "");
+
+  return {
+    postId: market.activePostId || market.lastPublishedPostId || latestPost?.id || "",
+    marketNumber: Number(market.activeNumber || market.lastPublishedNumber || inferredNumber || 0)
+  };
+}
+
 function getNextMarketCaption(state = readState()) {
   return `السوق رقم ${getMarketState(state).nextNumber || 1}`;
 }
@@ -555,10 +566,25 @@ function stopCommentMonitor() {
 }
 
 async function checkLatestPostComments() {
-  const state = readState();
+  let state = readState();
   const bot = getBotState(state);
-  const market = getMarketState(state);
   const connection = getResolvedPageConnection(state);
+  let market = getMarketState(state);
+
+  if (!market.activePostId) {
+    const latestKnown = getLatestKnownMarketPost(state);
+    if (latestKnown.postId) {
+      state = updateState((current) => {
+        current.market.activePostId = latestKnown.postId;
+        current.market.activeNumber = latestKnown.marketNumber || current.market.activeNumber || 0;
+        current.market.lastPublishedPostId = current.market.lastPublishedPostId || latestKnown.postId;
+        current.market.lastPublishedNumber =
+          current.market.lastPublishedNumber || latestKnown.marketNumber || current.market.lastPublishedNumber;
+        return current;
+      });
+      market = getMarketState(state);
+    }
+  }
 
   if (!bot.active || !market.activePostId || !connection.pageAccessToken) {
     return;
@@ -629,6 +655,13 @@ async function checkLatestPostComments() {
 
 function startCommentMonitor() {
   stopCommentMonitor();
+  void checkLatestPostComments().catch((error) => {
+    updateState((current) => {
+      current.scheduler.lastError = normalizeErrorMessage(error);
+      return current;
+    });
+    console.error("[comments] failed:", normalizeErrorMessage(error));
+  });
   commentMonitorTimer = setInterval(async () => {
     if (commentMonitorRunning) {
       return;
@@ -1457,6 +1490,10 @@ app.listen(config.port, async () => {
             current.market.lastPublishedNumber = inferredNumber;
             current.market.nextNumber = Math.max(current.market.nextNumber || 1, inferredNumber + 1);
             current.market.lastPublishedPostId = latestPost.id || current.market.lastPublishedPostId;
+          }
+          if (latestPost && !current.market.activePostId) {
+            current.market.activePostId = latestPost.id || current.market.activePostId;
+            current.market.activeNumber = inferredNumber || current.market.activeNumber || 0;
           }
           return current;
         });
