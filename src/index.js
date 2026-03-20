@@ -4,11 +4,16 @@ import path from "node:path";
 import express from "express";
 import { config, getMissingCoreConfig } from "./config.js";
 import {
+  enqueueCommentLike,
+  enqueueCommentReply,
   ensureDatabaseSeededFromState,
   initDatabase,
   isDatabaseConfigured,
   loadDatabaseSnapshot,
-  moveScheduledPostToPublished
+  markCommentLikeHandled,
+  markCommentReplyHandled,
+  moveScheduledPostToPublished,
+  upsertScheduledMarketPost
 } from "./database.js";
 import {
   exchangeCodeForLongLivedUserToken,
@@ -174,7 +179,7 @@ function ensureDashboardAuth(req, res, next) {
 function getScheduleSettings(state = readState()) {
   return {
     enabled: state.scheduler.enabled !== false,
-    intervalMinutes: config.publishIntervalMinutes
+    intervalMinutes: Math.max(1, Number(state.scheduler.intervalMinutes || config.publishIntervalMinutes || 480))
   };
 }
 
@@ -195,6 +200,7 @@ function getMarketState(state = readState()) {
     activeNumber: 0,
     activeCommentCount: 0,
     repliedComments: {},
+    repliedAuthors: {},
     lastPublishedAt: "",
     lastPublishedPostId: "",
     lastPublishedNumber: 0
@@ -260,6 +266,40 @@ function getResolvedPageConnection(state = readState()) {
 function normalizeErrorMessage(error) {
   const raw = String(error?.message || error || "").trim();
   return raw || "حدث خطأ غير معروف.";
+}
+
+function formatIntervalLabel(intervalMinutes) {
+  const minutes = Math.max(1, Number(intervalMinutes || 1));
+  if (minutes % 60 === 0) {
+    const hours = minutes / 60;
+    return hours === 1 ? "كل ساعة" : `كل ${hours} ساعات`;
+  }
+
+  return `كل ${minutes} دقيقة`;
+}
+
+async function syncScheduledMarketPostRecord(state = readState()) {
+  if (!isDatabaseConfigured()) {
+    return;
+  }
+
+  const market = getMarketState(state);
+  if (!market.imageFilename) {
+    return;
+  }
+
+  const schedule = getScheduleSettings(state);
+  const nextNumber = Number(market.nextNumber || 1);
+  const nextRunAt = getNextRunTimestamp(state) || new Date(Date.now() + schedule.intervalMinutes * 60 * 1000).toISOString();
+
+  await upsertScheduledMarketPost({
+    id: nextNumber,
+    message: `السوق رقم ${nextNumber}`,
+    createdAt: new Date().toISOString(),
+    scheduledFor: nextRunAt,
+    imageFilename: market.imageFilename,
+    marketNumber: nextNumber
+  });
 }
 
 function computeNextRunText(state = readState()) {
@@ -515,19 +555,6 @@ function isIgnorableLikeError(error) {
   return message.includes("already") || message.includes("liked") || message.includes("duplicate");
 }
 
-function isRateLimitError(error) {
-  const message = normalizeErrorMessage(error).toLowerCase();
-  return (
-    message.includes("rate limit") ||
-    message.includes("rate-limit") ||
-    message.includes("too many") ||
-    message.includes("temporarily blocked") ||
-    message.includes("try again later") ||
-    message.includes("نقيّد معدل") ||
-    message.includes("يمكنك إعادة المحاولة لاحقًا")
-  );
-}
-
 async function replyAndLikeComment({ commentId, pageAccessToken, replyText }) {
   let replyError = null;
 
@@ -542,10 +569,6 @@ async function replyAndLikeComment({ commentId, pageAccessToken, replyText }) {
       break;
     } catch (error) {
       replyError = error;
-      if (isRateLimitError(error)) {
-        throw error;
-      }
-
       if (attempt < 2) {
         await delay(4000 * attempt);
       }
@@ -609,11 +632,6 @@ async function checkLatestPostComments() {
     return;
   }
 
-  const pausedUntilMs = Date.parse(market.commentMonitorPausedUntil || "");
-  if (Number.isFinite(pausedUntilMs) && pausedUntilMs > Date.now()) {
-    return;
-  }
-
   const comments = await getPostComments({
     postId: market.activePostId,
     pageAccessToken: connection.pageAccessToken,
@@ -654,11 +672,33 @@ async function checkLatestPostComments() {
     const nextCommentNumber = Number(currentMarket.activeCommentCount || 0) + 1;
     const replyText = buildCommentReplyText(currentMarket.activeNumber, nextCommentNumber);
 
+    await enqueueCommentReply({
+      commentId,
+      postId: market.activePostId,
+      authorId: comment.from?.id || "",
+      authorName: comment.from?.name || "",
+      commentMessage: comment.message || "",
+      replyMessage: replyText,
+      marketNumber: currentMarket.activeNumber,
+      commentNumber: nextCommentNumber
+    });
+
+    await enqueueCommentLike({
+      commentId,
+      postId: market.activePostId,
+      authorId: comment.from?.id || "",
+      authorName: comment.from?.name || "",
+      commentMessage: comment.message || ""
+    });
+
     await replyAndLikeComment({
       commentId,
       pageAccessToken: connection.pageAccessToken,
       replyText
     });
+
+    await markCommentReplyHandled(commentId);
+    await markCommentLikeHandled(commentId);
 
     updateState((current) => {
       current.market.activeCommentCount = nextCommentNumber;
@@ -700,11 +740,6 @@ function startCommentMonitor() {
       const message = normalizeErrorMessage(error);
       updateState((current) => {
         current.scheduler.lastError = message;
-        if (isRateLimitError(error)) {
-          current.market.commentMonitorPausedUntil = new Date(
-            Date.now() + config.commentRateLimitCooldownMs
-          ).toISOString();
-        }
         return current;
       });
       console.error("[comments] failed:", message);
@@ -755,10 +790,12 @@ async function runPostingJob() {
   const postId = publishResult.post_id || publishResult.id;
 
   await moveScheduledPostToPublished({
-    queueId: null,
+    queueId: marketNumber,
     facebookPostId: postId,
     message: caption,
-    createdAt: publishedAt
+    createdAt: publishedAt,
+    imageFilename: market.imageFilename,
+    marketNumber
   });
 
   updateState((current) => {
@@ -778,13 +815,13 @@ async function runPostingJob() {
     current.market.activeCommentCount = 0;
     current.market.repliedComments = {};
     current.market.repliedAuthors = {};
-    current.market.commentMonitorPausedUntil = "";
     current.market.nextNumber = marketNumber + 1;
     current.scheduler.lastRunAt = new Date().toISOString();
     current.scheduler.lastResult = `تم نشر ${caption} بنجاح`;
     current.scheduler.lastError = "";
     return current;
   });
+  void syncScheduledMarketPostRecord(readState());
   startCommentMonitor();
 
   return {
@@ -834,13 +871,14 @@ function renderQueuedPostsEditor(state) {
   const market = getMarketState(state);
   const imageUrl = getMarketImageUrl(state);
   const hasImage = Boolean(imageUrl);
+  const schedule = getScheduleSettings(state);
 
   return `
     <section class="section">
       <h2>${icons.edit}<span>رفع صورة البوت</span></h2>
       <form method="post" action="/dashboard/content/image" enctype="multipart/form-data">
         ${renderField({
-          label: "اختر صورة واحدة فقط. سيعيد البوت نشرها كل 8 ساعات بعنوان السوق التالي.",
+          label: `اختر صورة واحدة فقط. سيعيد البوت نشرها ${formatIntervalLabel(schedule.intervalMinutes)} بعنوان السوق التالي.`,
           name: "marketImage",
           type: "file",
           value: ""
@@ -865,13 +903,13 @@ function renderQueuedPostsEditor(state) {
               <img src="${escapeHtml(imageUrl)}" alt="صورة البوت" style="width:100%;max-width:360px;border-radius:20px;border:1px solid rgba(20,54,45,.12)" />
             </article>
           </div>`
-        : `<div class="empty">ارفع صورة من الأعلى ليبدأ البوت إعادة نشرها كل 8 ساعات.</div>`
+        : `<div class="empty">ارفع صورة من الأعلى ليبدأ البوت إعادة نشرها ${formatIntervalLabel(schedule.intervalMinutes)}.</div>`
       }
     </section>
     <section class="section">
       <h2>${icons.spark}<span>الردود التلقائية</span></h2>
       <div class="empty">
-        يراقب البوت آخر منشور نشره فقط كل 15 ثانية، ويعالج تعليقًا واحدًا في كل دورة لتفادي تقييد فيسبوك.
+        يراقب البوت آخر منشور نشره فقط كل 15 ثانية، ويعالج تعليقًا واحدًا في كل دورة.
         <br />
         شكرا ربي يجيب السوق X.Y
       </div>
@@ -921,7 +959,7 @@ async function buildOverviewBody(state) {
         },
         {
           label: "وقت النشر",
-          value: `كل ${Math.round(schedule.intervalMinutes / 60)} ساعات`,
+          value: formatIntervalLabel(schedule.intervalMinutes),
           note: computeNextRunText(state),
           icon: icons.clock
         },
@@ -953,15 +991,33 @@ function buildTimingBody(state) {
   return `
     <section class="section">
       <h2>${icons.clock}<span>توقيت البوت</span></h2>
-      <div class="empty">
-        النشر مضبوط حاليًا على صورة واحدة كل 8 ساعات، مع فحص تعليقات آخر منشور كل 15 ثانية.
-      </div>
+      <form method="post" action="/dashboard/timing">
+        <div class="stack">
+          ${renderField({
+            label: "الفاصل بين المنشورات بالدقائق",
+            name: "intervalMinutes",
+            type: "number",
+            min: "1",
+            max: "10080",
+            value: schedule.intervalMinutes
+          })}
+          ${renderField({
+            label: "تشغيل النشر التلقائي",
+            name: "scheduleEnabled",
+            type: "checkbox",
+            checked: schedule.enabled
+          })}
+        </div>
+        <div class="actions">
+          <button class="btn btn-primary" type="submit">حفظ الوقت</button>
+        </div>
+      </form>
     </section>
     <section class="section">
       <h2>${icons.clock}<span>ملخص الوقت</span></h2>
       ${renderMetrics([
         { label: "الحالة الحالية", value: schedule.enabled ? "مفعلة" : "متوقفة", level: schedule.enabled ? "good" : "warn", icon: icons.status },
-        { label: "فاصل النشر", value: `${Math.round(schedule.intervalMinutes / 60)} ساعات`, icon: icons.clock },
+        { label: "فاصل النشر", value: formatIntervalLabel(schedule.intervalMinutes), icon: icons.clock },
         { label: "فحص التعليقات", value: "كل 15 ثانية", icon: icons.people },
         { label: "آخر تشغيل", value: state.scheduler.lastRunAt || "لم يتم بعد", icon: icons.status },
         { label: "الموعد القادم", value: computeNextRunText(state), icon: icons.spark }
@@ -1142,7 +1198,7 @@ async function buildSectionView(sectionKey, state) {
     case "timing":
       return {
         pageTitle: "التحكم في الوقت",
-        pageDescription: "هذا الإصدار ينشر صورة السوق كل 8 ساعات، ويفحص تعليقات آخر منشور بطريقة أهدأ وآمنة أكثر.",
+        pageDescription: "هذا الإصدار ينشر صورة السوق حسب الوقت الذي تحدده، ويفحص تعليقات آخر منشور بطريقة مستقرة.",
         body: buildTimingBody(state)
       };
     case "next-post":
@@ -1166,7 +1222,7 @@ async function buildSectionView(sectionKey, state) {
     case "content":
       return {
         pageTitle: "إدارة المنشورات",
-        pageDescription: "ارفع صورة واحدة وسيعيد البوت نشرها كل 8 ساعات مع ترقيم السوق تلقائيًا.",
+        pageDescription: "ارفع صورة واحدة وسيعيد البوت نشرها حسب الوقت الذي تحدده مع ترقيم السوق تلقائيًا.",
         body: buildContentBody(state)
       };
     default:
@@ -1256,8 +1312,28 @@ app.get("/dashboard/:section", ensureDashboardAuth, async (req, res) => {
 });
 
 app.post("/dashboard/timing", ensureDashboardAuth, (req, res) => {
+  const intervalMinutes = Number.parseInt(String(req.body.intervalMinutes || ""), 10);
+  const enabled = req.body.scheduleEnabled === "on";
+
+  if (!Number.isInteger(intervalMinutes) || intervalMinutes < 1 || intervalMinutes > 10080) {
+    redirectWithMessage(res, "/dashboard/timing", {
+      error: "وقت النشر يجب أن يكون رقمًا بين 1 و 10080 دقيقة."
+    });
+    return;
+  }
+
+  const nextState = updateState((current) => {
+    current.scheduler.intervalMinutes = intervalMinutes;
+    current.scheduler.enabled = enabled;
+    current.scheduler.lastError = "";
+    return current;
+  });
+
+  syncScheduler();
+  void syncScheduledMarketPostRecord(nextState);
+
   redirectWithMessage(res, "/dashboard/timing", {
-    notice: "توقيت هذا الإصدار ثابت: نشر كل 8 ساعات وفحص التعليقات كل 15 ثانية."
+    notice: enabled ? `تم حفظ وقت النشر على ${formatIntervalLabel(intervalMinutes)}.` : "تم إيقاف النشر التلقائي."
   });
 });
 
@@ -1329,7 +1405,7 @@ app.post("/dashboard/content/image", ensureDashboardAuth, upload.single("marketI
 
     fs.renameSync(req.file.path, finalPath);
 
-    updateState((current) => {
+    const nextState = updateState((current) => {
       current.market.imageFilename = finalFilename;
       current.market.imageOriginalName = req.file.originalname || finalFilename;
       current.market.imageMimeType = req.file.mimetype || "image/jpeg";
@@ -1338,6 +1414,7 @@ app.post("/dashboard/content/image", ensureDashboardAuth, upload.single("marketI
     });
 
     syncScheduler();
+    void syncScheduledMarketPostRecord(nextState);
     if (getBotState().active) {
       void maybeRunStartupPost();
     }
@@ -1535,6 +1612,7 @@ app.listen(config.port, async () => {
       }
 
       console.log("Postgres storage enabled");
+      await syncScheduledMarketPostRecord(readState());
       syncScheduler();
     } catch (error) {
       console.error("[database] failed:", normalizeErrorMessage(error));

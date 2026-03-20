@@ -23,7 +23,6 @@ const defaultState = {
     activeCommentCount: 0,
     repliedComments: {},
     repliedAuthors: {},
-    commentMonitorPausedUntil: "",
     lastPublishedAt: "",
     lastPublishedPostId: "",
     lastPublishedNumber: 0
@@ -70,11 +69,7 @@ export function readState() {
         repliedAuthors:
           parsed.market && parsed.market.repliedAuthors && typeof parsed.market.repliedAuthors === "object"
             ? parsed.market.repliedAuthors
-            : {},
-        commentMonitorPausedUntil:
-          parsed.market && typeof parsed.market.commentMonitorPausedUntil === "string"
-            ? parsed.market.commentMonitorPausedUntil
-            : ""
+            : {}
       },
       bot: {
         ...structuredClone(defaultState.bot),
