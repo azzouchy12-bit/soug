@@ -13,9 +13,36 @@ const uploadsDir = path.join(dataDir, "uploads");
 fs.mkdirSync(dataDir, { recursive: true });
 fs.mkdirSync(uploadsDir, { recursive: true });
 
+function readEnv(name, fallback = "") {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null) {
+    return fallback;
+  }
+
+  const trimmed = String(raw).trim();
+  if (!trimmed) {
+    return fallback;
+  }
+
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+
+  return trimmed;
+}
+
+function readTokenEnv(name, fallback = "") {
+  const value = readEnv(name, fallback);
+  return value.replace(/[\r\n]+/g, "").trim();
+}
+
 function computeBaseUrl() {
-  if (process.env.BASE_URL) {
-    const raw = process.env.BASE_URL.trim();
+  const configuredBaseUrl = readEnv("BASE_URL");
+  if (configuredBaseUrl) {
+    const raw = configuredBaseUrl;
     if (raw.startsWith("http://") || raw.startsWith("https://")) {
       return raw;
     }
@@ -23,27 +50,28 @@ function computeBaseUrl() {
     return `https://${raw}`;
   }
 
-  if (process.env.RAILWAY_PUBLIC_DOMAIN) {
-    return `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`;
+  const railwayDomain = readEnv("RAILWAY_PUBLIC_DOMAIN");
+  if (railwayDomain) {
+    return `https://${railwayDomain}`;
   }
 
   return "http://localhost:3000";
 }
 
 export const config = {
-  port: Number(process.env.PORT || 3000),
+  port: Number(readEnv("PORT", "3000") || 3000),
   baseUrl: computeBaseUrl(),
   dashboardAccessCode: "5598",
-  publishIntervalMinutes: Number(process.env.POST_INTERVAL_MINUTES || 8 * 60),
+  publishIntervalMinutes: Number(readEnv("POST_INTERVAL_MINUTES", String(8 * 60)) || 8 * 60),
   commentCheckIntervalMs: 15_000,
   repeatCommentReplyDelayMs: 30_000,
   commentActionGapMs: 3_000,
-  databaseUrl: process.env.DATABASE_URL || "",
-  facebookAppId: process.env.FB_APP_ID || "",
-  facebookAppSecret: process.env.FB_APP_SECRET || "",
-  facebookPageId: process.env.FB_PAGE_ID || "",
-  facebookPageAccessToken: process.env.FB_PAGE_ACCESS_TOKEN || "",
-  timezone: process.env.TIMEZONE || "UTC",
+  databaseUrl: readEnv("DATABASE_URL"),
+  facebookAppId: readEnv("FB_APP_ID"),
+  facebookAppSecret: readEnv("FB_APP_SECRET"),
+  facebookPageId: readEnv("FB_PAGE_ID"),
+  facebookPageAccessToken: readTokenEnv("FB_PAGE_ACCESS_TOKEN"),
+  timezone: readEnv("TIMEZONE", "UTC"),
   dataDir,
   stateFile,
   stateDir: dataDir,
