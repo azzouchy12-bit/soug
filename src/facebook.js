@@ -1,3 +1,4 @@
+import fs from "node:fs/promises";
 import { config } from "./config.js";
 
 const graphVersion = "v25.0";
@@ -39,6 +40,48 @@ async function graphRequest(pathname, options = {}) {
     method,
     headers,
     body: requestBody
+  });
+
+  const raw = await response.text();
+  let payload = {};
+
+  try {
+    payload = raw ? JSON.parse(raw) : {};
+  } catch {
+    payload = { raw };
+  }
+
+  if (!response.ok || payload.error) {
+    const message =
+      payload?.error?.message || payload?.raw || `Facebook request failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return payload;
+}
+
+async function graphMultipartRequest(pathname, { query = {}, fields = {} } = {}) {
+  const url = buildGraphUrl(pathname, query);
+  const form = new FormData();
+
+  for (const [key, value] of Object.entries(fields)) {
+    if (value === undefined || value === null || value === "") {
+      continue;
+    }
+
+    if (value && typeof value === "object" && value.type === "file") {
+      const buffer = await fs.readFile(value.path);
+      const blob = new Blob([buffer], { type: value.mimeType || "application/octet-stream" });
+      form.set(key, blob, value.filename || "upload.bin");
+      continue;
+    }
+
+    form.set(key, String(value));
+  }
+
+  const response = await fetch(url, {
+    method: "POST",
+    body: form
   });
 
   const raw = await response.text();
@@ -123,6 +166,22 @@ export async function publishPagePost({ pageId, pageAccessToken, message }) {
   });
 }
 
+export async function publishPagePhoto({ pageId, pageAccessToken, caption, imagePath, imageMimeType, imageFilename }) {
+  return graphMultipartRequest(`/${pageId}/photos`, {
+    fields: {
+      access_token: pageAccessToken,
+      caption,
+      published: true,
+      source: {
+        type: "file",
+        path: imagePath,
+        mimeType: imageMimeType,
+        filename: imageFilename
+      }
+    }
+  });
+}
+
 export async function getPageProfile({ pageId, pageAccessToken }) {
   return graphRequest(`/${pageId}`, {
     query: {
@@ -151,4 +210,23 @@ export async function getPostComments({ postId, pageAccessToken, limit = 10 }) {
   });
 
   return response.data || [];
+}
+
+export async function likeComment({ commentId, pageAccessToken }) {
+  return graphRequest(`/${commentId}/likes`, {
+    method: "POST",
+    body: {
+      access_token: pageAccessToken
+    }
+  });
+}
+
+export async function replyToComment({ commentId, pageAccessToken, message }) {
+  return graphRequest(`/${commentId}/comments`, {
+    method: "POST",
+    body: {
+      access_token: pageAccessToken,
+      message
+    }
+  });
 }

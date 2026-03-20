@@ -13,8 +13,18 @@ const defaultState = {
   queuedPosts: [],
   queueCounter: 0,
   posts: [],
-  ai: {
-    cache: []
+  market: {
+    imageFilename: "",
+    imageOriginalName: "",
+    imageMimeType: "",
+    nextNumber: 1,
+    activePostId: "",
+    activeNumber: 0,
+    activeCommentCount: 0,
+    repliedComments: {},
+    lastPublishedAt: "",
+    lastPublishedPostId: "",
+    lastPublishedNumber: 0
   },
   bot: {
     active: false,
@@ -22,7 +32,7 @@ const defaultState = {
   },
   scheduler: {
     enabled: true,
-    intervalMinutes: config.postIntervalMinutes,
+    intervalMinutes: config.publishIntervalMinutes,
     lastRunAt: "",
     lastResult: "",
     lastError: ""
@@ -48,9 +58,13 @@ export function readState() {
       queuedPosts: Array.isArray(parsed.queuedPosts) ? parsed.queuedPosts : [],
       queueCounter: Number.isInteger(parsed.queueCounter) ? parsed.queueCounter : 0,
       posts: Array.isArray(parsed.posts) ? parsed.posts : [],
-      ai: {
-        ...structuredClone(defaultState.ai),
-        cache: Array.isArray(parsed.ai?.cache) ? parsed.ai.cache : []
+      market: {
+        ...structuredClone(defaultState.market),
+        ...(parsed.market || {}),
+        repliedComments:
+          parsed.market && parsed.market.repliedComments && typeof parsed.market.repliedComments === "object"
+            ? parsed.market.repliedComments
+            : {}
       },
       bot: {
         ...structuredClone(defaultState.bot),

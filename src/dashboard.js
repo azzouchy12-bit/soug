@@ -619,6 +619,15 @@ export function renderField({ label, name, value, type = "text", min = "", max =
     `;
   }
 
+  if (type === "file") {
+    return `
+      <div>
+        <label for="${escapeHtml(name)}">${escapeHtml(label)}</label>
+        <input id="${escapeHtml(name)}" name="${escapeHtml(name)}" type="file" />
+      </div>
+    `;
+  }
+
   return `
     <div>
       <label for="${escapeHtml(name)}">${escapeHtml(label)}</label>

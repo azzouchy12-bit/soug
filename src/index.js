@@ -1,12 +1,11 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import express from "express";
-import { generatePostsWithDeepSeek } from "./ai.js";
 import { config, getMissingCoreConfig } from "./config.js";
 import {
-  deleteScheduledPost,
   ensureDatabaseSeededFromState,
   initDatabase,
-  insertScheduledPosts,
   isDatabaseConfigured,
   loadDatabaseSnapshot,
   moveScheduledPostToPublished
@@ -18,7 +17,9 @@ import {
   getPageProfile,
   getPostComments,
   getPostDetails,
-  publishPagePost
+  likeComment,
+  publishPagePhoto,
+  replyToComment
 } from "./facebook.js";
 import { getSchedulerSnapshot, schedulerIsActive, startScheduler, stopScheduler } from "./scheduler.js";
 import { readState, updateState } from "./storage.js";
@@ -32,14 +33,17 @@ import {
   renderItems,
   sectionExists
 } from "./dashboard.js";
+import multer from "multer";
 
 const app = express();
 const DASHBOARD_COOKIE = "dashboard_session";
-let queueRefillPromise = null;
+let commentMonitorTimer = null;
+const upload = multer({ dest: config.uploadsDir });
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.set("trust proxy", true);
+app.use("/uploads", express.static(config.uploadsDir));
 
 function parseCookies(req) {
   const header = req.headers.cookie || "";
@@ -167,14 +171,9 @@ function ensureDashboardAuth(req, res, next) {
 }
 
 function getScheduleSettings(state = readState()) {
-  const intervalMinutes = Math.max(
-    1,
-    Number.parseInt(String(state.scheduler.intervalMinutes || config.postIntervalMinutes), 10)
-  );
-
   return {
     enabled: state.scheduler.enabled !== false,
-    intervalMinutes
+    intervalMinutes: config.publishIntervalMinutes
   };
 }
 
@@ -183,6 +182,40 @@ function getBotState(state = readState()) {
     active: state.bot?.active === true,
     startedAt: state.bot?.startedAt || ""
   };
+}
+
+function getMarketState(state = readState()) {
+  return state.market || {
+    imageFilename: "",
+    imageOriginalName: "",
+    imageMimeType: "",
+    nextNumber: 1,
+    activePostId: "",
+    activeNumber: 0,
+    activeCommentCount: 0,
+    repliedComments: {},
+    lastPublishedAt: "",
+    lastPublishedPostId: "",
+    lastPublishedNumber: 0
+  };
+}
+
+function getMarketImagePath(state = readState()) {
+  const market = getMarketState(state);
+  if (!market.imageFilename) {
+    return "";
+  }
+
+  return path.join(config.uploadsDir, market.imageFilename);
+}
+
+function getMarketImageUrl(state = readState()) {
+  const market = getMarketState(state);
+  return market.imageFilename ? `/uploads/${encodeURIComponent(market.imageFilename)}` : "";
+}
+
+function getNextMarketCaption(state = readState()) {
+  return `السوق رقم ${getMarketState(state).nextNumber || 1}`;
 }
 
 function hasDirectPageAccessToken() {
@@ -217,146 +250,10 @@ function normalizeErrorMessage(error) {
   return raw || "حدث خطأ غير معروف.";
 }
 
-function parseQueuedPosts(rawText) {
-  const matches = [];
-  const regex = /@([\s\S]*?)@/g;
-  let match;
-
-  while ((match = regex.exec(rawText)) !== null) {
-    const text = match[1].trim();
-    if (text) {
-      matches.push(text);
-    }
-  }
-
-  return matches;
-}
-
-function getQueuedPosts(state = readState()) {
-  return Array.isArray(state.queuedPosts) ? state.queuedPosts : [];
-}
-
-async function addPostsToQueue(postTexts) {
-  const currentState = readState();
-  let nextCounter = currentState.queueCounter;
-  const queuedEntries = postTexts.map((text) => {
-    nextCounter += 1;
-    return {
-      id: nextCounter,
-      text,
-      createdAt: new Date().toISOString()
-    };
-  });
-
-  await insertScheduledPosts(queuedEntries);
-
-  const nextState = updateState((current) => {
-    current.queueCounter = nextCounter;
-    current.queuedPosts.push(...queuedEntries);
-    return current;
-  });
-
-  syncScheduler();
-  return nextState;
-}
-
-async function ensureQueueRefill(reason = "") {
-  if (!config.queueRefillThreshold || config.queueRefillThreshold < 1) {
-    return null;
-  }
-
-  const state = readState();
-  const bot = getBotState(state);
-  if (!bot.active) {
-    return null;
-  }
-
-  if (queueRefillPromise) {
-    return queueRefillPromise;
-  }
-
-  const currentQueued = getQueuedPosts(state).length;
-  if (currentQueued >= config.queueRefillThreshold) {
-    return null;
-  }
-
-  queueRefillPromise = (async () => {
-    let latestState = readState();
-
-    if (isDatabaseConfigured()) {
-      const snapshot = await loadDatabaseSnapshot();
-      if (snapshot) {
-        latestState = updateState((current) => {
-          current.queuedPosts = snapshot.queuedPosts;
-          current.posts = snapshot.posts;
-          current.queueCounter = Math.max(current.queueCounter, snapshot.queueCounter);
-          return current;
-        });
-      }
-    }
-
-    if (getQueuedPosts(latestState).length >= config.queueRefillThreshold) {
-      return latestState;
-    }
-
-    const existingPosts = [
-      ...getQueuedPosts(latestState).map((post) => post.text),
-      ...latestState.posts.slice(-8).map((post) => post.message)
-    ];
-    const generatedPosts = await generatePostsWithDeepSeek({
-      prompt: config.topic,
-      count: config.postsPerBatch,
-      existingPosts
-    });
-    const nextState = await addPostsToQueue(generatedPosts);
-
-    updateState((current) => {
-      current.scheduler.lastResult = `تمت تعبئة الطابور تلقائيًا بـ ${generatedPosts.length} منشور(ات)${reason ? ` - ${reason}` : ""}`;
-      current.scheduler.lastError = "";
-      return current;
-    });
-
-    console.log(`[refill] queued ${generatedPosts.length} posts${reason ? ` (${reason})` : ""}`);
-    return nextState;
-  })().finally(() => {
-    queueRefillPromise = null;
-  });
-
-  return queueRefillPromise;
-}
-
-function renderQueuedPostsList(queuedPosts) {
-  if (!queuedPosts.length) {
-    return `<div class="empty">لا توجد منشورات مبرمجة بعد. ألصق نصك بين @ و @ لإضافة أي عدد تريده.</div>`;
-  }
-
-  return `<div class="queue-list">
-    ${queuedPosts
-      .map(
-        (post, index) => `
-          <article class="queue-card">
-            <div class="queue-head">
-              <span class="queue-number">#${index + 1} <small>المعرف ${escapeHtml(post.id)}</small></span>
-              <form method="post" action="/dashboard/content/delete/${encodeURIComponent(post.id)}">
-                <button class="queue-delete" type="submit">x</button>
-              </form>
-            </div>
-            <pre class="queue-text">${escapeHtml(post.text)}</pre>
-          </article>
-        `
-      )
-      .join("")}
-  </div>`;
-}
-
-function getNextQueuedPost(state = readState()) {
-  return getQueuedPosts(state)[0] || null;
-}
-
 function computeNextRunText(state = readState()) {
   const schedule = getScheduleSettings(state);
   const bot = getBotState(state);
-  const nextPost = getNextQueuedPost(state);
+  const market = getMarketState(state);
 
   if (!bot.active) {
     return "البوت متوقف";
@@ -366,12 +263,12 @@ function computeNextRunText(state = readState()) {
     return "الجدولة متوقفة من الإعدادات";
   }
 
-  if (!nextPost) {
-    return "لا توجد منشورات مبرمجة حاليًا";
+  if (!market.imageFilename) {
+    return "ارفع صورة البوت أولًا";
   }
 
   if (!state.scheduler.lastRunAt) {
-    return `بعد بدء الخدمة أو خلال ${schedule.intervalMinutes} دقيقة`;
+    return "فور تشغيل البوت";
   }
 
   const next = new Date(new Date(state.scheduler.lastRunAt).getTime() + schedule.intervalMinutes * 60 * 1000);
@@ -381,16 +278,21 @@ function computeNextRunText(state = readState()) {
 function getNextRunTimestamp(state = readState()) {
   const schedule = getScheduleSettings(state);
   const bot = getBotState(state);
+  const market = getMarketState(state);
 
   if (!bot.active || !schedule.enabled) {
     return "";
   }
 
-  if (!getNextQueuedPost(state)) {
+  if (!market.imageFilename) {
     return "";
   }
 
-  const reference = state.scheduler.lastRunAt || bot.startedAt;
+  if (!state.scheduler.lastRunAt) {
+    return new Date().toISOString();
+  }
+
+  const reference = state.scheduler.lastRunAt;
   if (!reference) {
     return "";
   }
@@ -586,6 +488,104 @@ async function refreshDirectPageProfile() {
   } catch {}
 }
 
+function buildCommentReplyText(marketNumber, commentNumber) {
+  return `شكرا ربي يجيب السوق ${marketNumber}.${commentNumber}`;
+}
+
+function extractMarketNumberFromMessage(message) {
+  const match = String(message || "").match(/السوق رقم\s+(\d+)/);
+  return match ? Number.parseInt(match[1], 10) : 0;
+}
+
+function stopCommentMonitor() {
+  if (commentMonitorTimer) {
+    clearInterval(commentMonitorTimer);
+    commentMonitorTimer = null;
+  }
+}
+
+async function checkLatestPostComments() {
+  const state = readState();
+  const bot = getBotState(state);
+  const market = getMarketState(state);
+  const connection = getResolvedPageConnection(state);
+
+  if (!bot.active || !market.activePostId || !connection.pageAccessToken) {
+    return;
+  }
+
+  const comments = await getPostComments({
+    postId: market.activePostId,
+    pageAccessToken: connection.pageAccessToken,
+    limit: 50
+  });
+
+  const sortedComments = [...comments].sort(
+    (left, right) => Date.parse(left.created_time || 0) - Date.parse(right.created_time || 0)
+  );
+
+  for (const comment of sortedComments) {
+    const commentId = String(comment.id || "");
+    if (!commentId) {
+      continue;
+    }
+
+    const currentState = readState();
+    const currentMarket = getMarketState(currentState);
+    if (currentMarket.activePostId !== market.activePostId) {
+      return;
+    }
+
+    if (currentMarket.repliedComments?.[commentId]) {
+      continue;
+    }
+
+    if (comment.from?.id && comment.from.id === connection.pageId) {
+      continue;
+    }
+
+    const nextCommentNumber = Number(currentMarket.activeCommentCount || 0) + 1;
+    const replyText = buildCommentReplyText(currentMarket.activeNumber, nextCommentNumber);
+
+    await likeComment({
+      commentId,
+      pageAccessToken: connection.pageAccessToken
+    });
+
+    await replyToComment({
+      commentId,
+      pageAccessToken: connection.pageAccessToken,
+      message: replyText
+    });
+
+    updateState((current) => {
+      current.market.activeCommentCount = nextCommentNumber;
+      current.market.repliedComments = {
+        ...(current.market.repliedComments || {}),
+        [commentId]: replyText
+      };
+      current.scheduler.lastResult = `تم الرد على تعليق جديد في السوق ${current.market.activeNumber}.${nextCommentNumber}`;
+      current.scheduler.lastError = "";
+      return current;
+    });
+  }
+}
+
+function startCommentMonitor() {
+  stopCommentMonitor();
+  commentMonitorTimer = setInterval(async () => {
+    try {
+      await checkLatestPostComments();
+    } catch (error) {
+      updateState((current) => {
+        current.scheduler.lastError = normalizeErrorMessage(error);
+        return current;
+      });
+      console.error("[comments] failed:", normalizeErrorMessage(error));
+    }
+  }, config.commentCheckIntervalMinutes * 60 * 1000);
+}
+
 async function runPostingJob() {
   let state = readState();
   if (isDatabaseConfigured()) {
@@ -601,51 +601,65 @@ async function runPostingJob() {
   }
 
   const connection = getResolvedPageConnection(state);
-  const nextPost = getNextQueuedPost(state);
+  const market = getMarketState(state);
+  const imagePath = getMarketImagePath(state);
+  const marketNumber = Number(market.nextNumber || 1);
+  const caption = `السوق رقم ${marketNumber}`;
 
   if (!connection.pageId || !connection.pageAccessToken) {
     throw new Error("الصفحة غير جاهزة بعد. أضف FB_PAGE_ACCESS_TOKEN الصحيح.");
   }
 
-  if (!nextPost) {
-    throw new Error("لا توجد منشورات مبرمجة للنشر حاليًا.");
+  if (!market.imageFilename || !imagePath || !fs.existsSync(imagePath)) {
+    throw new Error("ارفع صورة البوت من الداشبورد أولًا.");
   }
 
-  const publishResult = await publishPagePost({
+  const publishResult = await publishPagePhoto({
     pageId: connection.pageId,
     pageAccessToken: connection.pageAccessToken,
-    message: nextPost.text
+    imagePath,
+    imageMimeType: market.imageMimeType || "image/jpeg",
+    imageFilename: market.imageOriginalName || market.imageFilename,
+    caption
   });
 
   const publishedAt = new Date().toISOString();
+  const postId = publishResult.post_id || publishResult.id;
 
   await moveScheduledPostToPublished({
-    queueId: nextPost.id,
-    facebookPostId: publishResult.id,
-    message: nextPost.text,
+    queueId: null,
+    facebookPostId: postId,
+    message: caption,
     createdAt: publishedAt
   });
 
   updateState((current) => {
-    current.queuedPosts = current.queuedPosts.filter((post) => post.id !== nextPost.id);
     current.posts.push({
-      id: publishResult.id,
-      message: nextPost.text,
+      id: postId,
+      message: caption,
       createdAt: publishedAt,
-      queueId: nextPost.id
+      queueId: null,
+      marketNumber
     });
     current.posts = current.posts.slice(-40);
+    current.market.lastPublishedAt = publishedAt;
+    current.market.lastPublishedPostId = postId;
+    current.market.lastPublishedNumber = marketNumber;
+    current.market.activePostId = postId;
+    current.market.activeNumber = marketNumber;
+    current.market.activeCommentCount = 0;
+    current.market.repliedComments = {};
+    current.market.nextNumber = marketNumber + 1;
     current.scheduler.lastRunAt = new Date().toISOString();
-    current.scheduler.lastResult = `تم نشر المنشور رقم ${nextPost.id} بنجاح`;
+    current.scheduler.lastResult = `تم نشر ${caption} بنجاح`;
     current.scheduler.lastError = "";
     return current;
   });
-
-  await ensureQueueRefill("after-publish");
+  startCommentMonitor();
 
   return {
-    postId: publishResult.id,
-    message: nextPost.text
+    postId,
+    message: caption
   };
 }
 
@@ -656,16 +670,18 @@ function syncScheduler() {
 
   if (!schedule.enabled || !bot.active) {
     stopScheduler();
+    stopCommentMonitor();
     return getSchedulerSnapshot();
   }
 
+  startCommentMonitor();
+
   startScheduler(async () => {
     try {
-      await ensureQueueRefill("scheduler");
-      if (!getNextQueuedPost(readState())) {
-        return;
+      const currentState = readState();
+      if (!getMarketState(currentState).imageFilename) {
+        throw new Error("ارفع صورة البوت من الداشبورد أولًا.");
       }
-
       await runPostingJob();
     } catch (error) {
       updateState((current) => {
@@ -685,162 +701,59 @@ function syncScheduler() {
 }
 
 function renderQueuedPostsEditor(state) {
-  const queuedPosts = getQueuedPosts(state);
+  const market = getMarketState(state);
+  const imageUrl = getMarketImageUrl(state);
+  const hasImage = Boolean(imageUrl);
 
   return `
     <section class="section">
-      <h2>${icons.spark}<span>توليد منشورات بالذكاء الاصطناعي عبر DeepSeek</span></h2>
-      <form id="aiPostsForm" method="post" action="/dashboard/content/ai">
+      <h2>${icons.edit}<span>رفع صورة البوت</span></h2>
+      <form method="post" action="/dashboard/content/image" enctype="multipart/form-data">
         ${renderField({
-          label: `اكتب التوجيه الإضافي للتوليد. الموضوع الافتراضي الحالي: ${config.topic} | اللغة: ${config.language} | الأسلوب: ${config.style}.`,
-          name: "aiPrompt",
-          type: "textarea",
-          value: config.topic,
-          rows: 6
-        })}
-        ${renderField({
-          label: "عدد المنشورات المطلوب توليدها",
-          name: "aiCount",
-          type: "number",
-          value: String(config.postsPerBatch),
-          min: "1",
-          max: "50"
+          label: "اختر صورة واحدة فقط. سيعيد البوت نشرها كل 8 ساعات بعنوان السوق التالي.",
+          name: "marketImage",
+          type: "file",
+          value: ""
         })}
         <div class="actions">
-          <button class="btn btn-primary" type="submit">توليد وإضافة للطابور</button>
+          <button class="btn btn-primary" type="submit">رفع الصورة</button>
         </div>
       </form>
     </section>
     <section class="section">
-      <h2>${icons.edit}<span>إضافة منشورات جديدة</span></h2>
-      <form id="bulkPostsForm" method="post" action="/dashboard/content">
-        ${renderField({
-          label: "ألصق هنا نصًا كبيرًا، وكل جزء بين @ و @ سيتم اعتباره منشورًا مستقلاً.",
-          name: "bulkText",
-          type: "textarea",
-          value: "",
-          rows: 10
-        })}
-        <div class="actions">
-          <button class="btn btn-primary" type="submit">إضافة المنشورات</button>
-        </div>
-      </form>
+      <h2>${icons.overview}<span>إعداد البوت الحالي</span></h2>
+      ${renderMetrics([
+        { label: "الصورة الحالية", value: hasImage ? "مرفوعة" : "غير مرفوعة", icon: icons.page },
+        { label: "المنشور القادم", value: `السوق رقم ${market.nextNumber || 1}`, icon: icons.spark },
+        { label: "آخر منشور", value: market.lastPublishedNumber ? `السوق رقم ${market.lastPublishedNumber}` : "لم ينشر بعد", icon: icons.posts },
+        { label: "فحص التعليقات", value: `كل ${config.commentCheckIntervalMinutes} دقيقة`, icon: icons.clock }
+      ])}
+      ${hasImage
+        ? `<div class="stack">
+            <article class="item">
+              <div class="item-meta">الصورة الحالية: ${escapeHtml(market.imageOriginalName || market.imageFilename)}</div>
+              <img src="${escapeHtml(imageUrl)}" alt="صورة البوت" style="width:100%;max-width:360px;border-radius:20px;border:1px solid rgba(20,54,45,.12)" />
+            </article>
+          </div>`
+        : `<div class="empty">ارفع صورة من الأعلى ليبدأ البوت إعادة نشرها كل 8 ساعات.</div>`
+      }
     </section>
-    <div class="modal-backdrop" id="contentResultModal" aria-hidden="true">
-      <div class="modal">
-        <h3 id="contentResultTitle">تمت العملية</h3>
-        <p id="contentResultMessage">تم تحديث القائمة.</p>
-        <div class="modal-actions">
-          <button class="btn btn-primary" type="button" id="contentResultOk">موافق</button>
-        </div>
+    <section class="section">
+      <h2>${icons.spark}<span>الردود التلقائية</span></h2>
+      <div class="empty">
+        يراقب البوت آخر منشور نشره فقط كل دقيقة، ويضع إعجابًا لكل تعليق جديد ثم يرد بصيغة:
+        <br />
+        شكرا ربي يجيب السوق X.Y
       </div>
-    </div>
-    <section class="section">
-      <h2>${icons.posts}<span>المنشورات المبرمجة للنشر</span></h2>
-      <div id="queuedPostsContainer">${renderQueuedPostsList(queuedPosts)}</div>
     </section>
-    <script>
-      (() => {
-        const form = document.getElementById("bulkPostsForm");
-        const aiForm = document.getElementById("aiPostsForm");
-        const modal = document.getElementById("contentResultModal");
-        const title = document.getElementById("contentResultTitle");
-        const message = document.getElementById("contentResultMessage");
-        const okButton = document.getElementById("contentResultOk");
-        const queuedPostsContainer = document.getElementById("queuedPostsContainer");
-
-        if (!form || !aiForm || !modal || !title || !message || !okButton || !queuedPostsContainer) {
-          return;
-        }
-
-        const textarea = form.querySelector('textarea[name="bulkText"]');
-        const aiTextarea = aiForm.querySelector('textarea[name="aiPrompt"]');
-        const aiCountInput = aiForm.querySelector('input[name="aiCount"]');
-
-        const openModal = (nextTitle, nextMessage) => {
-          title.textContent = nextTitle;
-          message.textContent = nextMessage;
-          modal.classList.add("open");
-          modal.setAttribute("aria-hidden", "false");
-        };
-
-        const closeModal = () => {
-          modal.classList.remove("open");
-          modal.setAttribute("aria-hidden", "true");
-        };
-
-        okButton.addEventListener("click", closeModal);
-        modal.addEventListener("click", (event) => {
-          if (event.target === modal) {
-            closeModal();
-          }
-        });
-
-        const submitForm = async (activeForm, options = {}) => {
-          const formData = new FormData(activeForm);
-
-          try {
-            const response = await fetch(activeForm.action, {
-              method: "POST",
-              headers: {
-                Accept: "application/json"
-              },
-              body: new URLSearchParams(formData)
-            });
-
-            const payload = await response.json();
-
-            if (!response.ok || !payload.ok) {
-              openModal(options.errorTitle || "تعذر إتمام العملية", payload.error || "حدث خطأ أثناء تنفيذ الطلب.");
-              return;
-            }
-
-            queuedPostsContainer.innerHTML = payload.queueHtml || "";
-            if (options.resetManual && textarea) {
-              textarea.value = "";
-            }
-            if (options.resetAi) {
-              if (aiTextarea) {
-                aiTextarea.value = "";
-              }
-              if (aiCountInput) {
-                aiCountInput.value = "${String(config.postsPerBatch)}";
-              }
-            }
-            openModal(options.successTitle || "تمت العملية", payload.message || "تمت العملية بنجاح.");
-          } catch (error) {
-            openModal(options.errorTitle || "تعذر إتمام العملية", "تعذر الاتصال بالخادم. حاول مرة أخرى.");
-          }
-        };
-
-        form.addEventListener("submit", async (event) => {
-          event.preventDefault();
-          await submitForm(form, {
-            resetManual: true,
-            successTitle: "تمت إضافة المنشورات",
-            errorTitle: "تعذر إضافة المنشورات"
-          });
-        });
-
-        aiForm.addEventListener("submit", async (event) => {
-          event.preventDefault();
-          await submitForm(aiForm, {
-            resetAi: true,
-            successTitle: "تم توليد المنشورات",
-            errorTitle: "تعذر توليد المنشورات"
-          });
-        });
-      })();
-    </script>
   `;
 }
 
 async function buildOverviewBody(state) {
   const schedule = getScheduleSettings(state);
   const connection = getResolvedPageConnection(state);
-  const queuedPosts = getQueuedPosts(state);
-  const nextPost = getNextQueuedPost(state);
   const bot = getBotState(state);
+  const market = getMarketState(state);
 
   return `
     <section class="section">
@@ -853,9 +766,9 @@ async function buildOverviewBody(state) {
           icon: icons.clock
         },
         {
-          label: "عدد المنشورات المبرمجة",
-          value: String(queuedPosts.length),
-          note: nextPost ? `المنشور التالي هو رقم ${queuedPosts.findIndex((post) => post.id === nextPost.id) + 1}` : "لا يوجد منشور جاهز الآن",
+          label: "الصورة الحالية",
+          value: market.imageFilename ? "جاهزة" : "غير مرفوعة",
+          note: market.imageOriginalName || "ارفع صورة من إدارة المنشورات",
           icon: icons.posts
         },
         {
@@ -865,6 +778,12 @@ async function buildOverviewBody(state) {
           icon: icons.status
         },
         {
+          label: "السوق القادم",
+          value: `السوق رقم ${market.nextNumber || 1}`,
+          note: market.lastPublishedNumber ? `آخر منشور كان السوق رقم ${market.lastPublishedNumber}` : "لم ينشر شيء بعد",
+          icon: icons.spark
+        },
+        {
           label: "الصفحة",
           value: connection.pageName,
           note: `FB_PAGE_ID: ${config.facebookPageId}`,
@@ -872,9 +791,15 @@ async function buildOverviewBody(state) {
         },
         {
           label: "وقت النشر",
-          value: `كل ${schedule.intervalMinutes} دقيقة`,
+          value: `كل ${Math.round(schedule.intervalMinutes / 60)} ساعات`,
           note: computeNextRunText(state),
           icon: icons.clock
+        },
+        {
+          label: "فحص التعليقات",
+          value: `كل ${config.commentCheckIntervalMinutes} دقيقة`,
+          note: market.activePostId ? `يتابع الآن السوق رقم ${market.activeNumber}` : "سينتظر أول منشور",
+          icon: icons.people
         }
       ])}
     </section>
@@ -895,90 +820,40 @@ function buildTimingBody(state) {
   const schedule = getScheduleSettings(state);
   return `
     <section class="section">
-      <h2>${icons.clock}<span>التحكم في وقت النشر</span></h2>
-      <form id="timingForm" method="post" action="/dashboard/timing">
-        <div class="stack">
-          ${renderField({ label: "الفاصل بين المنشورات بالدقائق", name: "intervalMinutes", type: "number", min: "1", max: "1440", value: schedule.intervalMinutes })}
-          ${renderField({ label: "تشغيل النشر التلقائي", name: "scheduleEnabled", type: "checkbox", checked: schedule.enabled })}
-        </div>
-        <div class="helper">بعد الحفظ سيتم تحديث المؤقت فورًا دون الحاجة إلى إعادة تشغيل التطبيق.</div>
-        <div class="actions">
-          <button class="btn btn-primary" type="button" id="openTimingConfirm">حفظ الوقت</button>
-        </div>
-      </form>
-    </section>
-    <div class="modal-backdrop" id="timingConfirmModal" aria-hidden="true">
-      <div class="modal">
-        <h3>تأكيد تغيير الوقت</h3>
-        <p>هل أنت متأكد من تغيير وقت النشر؟ بعد الضغط على تأكيد سيتم حفظ الوقت الجديد مباشرة.</p>
-        <div class="modal-actions">
-          <button class="btn btn-primary" type="button" id="confirmTimingSave">تأكيد</button>
-          <button class="btn btn-secondary" type="button" id="cancelTimingSave">إلغاء</button>
-        </div>
+      <h2>${icons.clock}<span>توقيت البوت</span></h2>
+      <div class="empty">
+        النشر مضبوط حاليًا على صورة واحدة كل 8 ساعات، مع فحص تعليقات آخر منشور كل دقيقة.
       </div>
-    </div>
+    </section>
     <section class="section">
       <h2>${icons.clock}<span>ملخص الوقت</span></h2>
       ${renderMetrics([
         { label: "الحالة الحالية", value: schedule.enabled ? "مفعلة" : "متوقفة", level: schedule.enabled ? "good" : "warn", icon: icons.status },
-        { label: "الفاصل", value: `${schedule.intervalMinutes} دقيقة`, icon: icons.clock },
+        { label: "فاصل النشر", value: `${Math.round(schedule.intervalMinutes / 60)} ساعات`, icon: icons.clock },
+        { label: "فحص التعليقات", value: `كل ${config.commentCheckIntervalMinutes} دقيقة`, icon: icons.people },
         { label: "آخر تشغيل", value: state.scheduler.lastRunAt || "لم يتم بعد", icon: icons.status },
         { label: "الموعد القادم", value: computeNextRunText(state), icon: icons.spark }
       ])}
     </section>
-    <script>
-      (() => {
-        const form = document.getElementById("timingForm");
-        const modal = document.getElementById("timingConfirmModal");
-        const openButton = document.getElementById("openTimingConfirm");
-        const confirmButton = document.getElementById("confirmTimingSave");
-        const cancelButton = document.getElementById("cancelTimingSave");
-
-        if (!form || !modal || !openButton || !confirmButton || !cancelButton) {
-          return;
-        }
-
-        const openModal = () => {
-          modal.classList.add("open");
-          modal.setAttribute("aria-hidden", "false");
-        };
-
-        const closeModal = () => {
-          modal.classList.remove("open");
-          modal.setAttribute("aria-hidden", "true");
-        };
-
-        openButton.addEventListener("click", openModal);
-        cancelButton.addEventListener("click", closeModal);
-        confirmButton.addEventListener("click", () => form.submit());
-        modal.addEventListener("click", (event) => {
-          if (event.target === modal) {
-            closeModal();
-          }
-        });
-      })();
-    </script>
   `;
 }
 
 function buildNextPostBody(state) {
-  const queuedPosts = getQueuedPosts(state);
-  const nextPost = getNextQueuedPost(state);
-  const nextIndex = nextPost ? queuedPosts.findIndex((post) => post.id === nextPost.id) + 1 : 0;
+  const market = getMarketState(state);
+  const imageUrl = getMarketImageUrl(state);
 
   return `
     <section class="section">
       <h2>${icons.spark}<span>المنشور التالي</span></h2>
-      ${nextPost
-        ? `<div class="queue-list">
-            <article class="queue-card">
-              <div class="queue-head">
-                <span class="queue-number">#${nextIndex} <small>المعرف ${escapeHtml(nextPost.id)}</small></span>
-              </div>
-              <pre class="queue-text">${escapeHtml(nextPost.text)}</pre>
+      ${imageUrl
+        ? `<div class="stack">
+            <article class="item">
+              <div class="item-meta">العنوان القادم: السوق رقم ${market.nextNumber || 1}</div>
+              <pre class="item-text">السوق رقم ${market.nextNumber || 1}</pre>
+              <img src="${escapeHtml(imageUrl)}" alt="صورة السوق القادمة" style="width:100%;max-width:420px;border-radius:20px;border:1px solid rgba(20,54,45,.12);margin-top:16px" />
             </article>
           </div>`
-        : `<div class="empty">لا يوجد أي منشور مبرمج حاليًا. أضف منشورات من صفحة إدارة المنشورات.</div>`
+        : `<div class="empty">لا توجد صورة مرفوعة بعد. ارفع صورة من صفحة إدارة المنشورات.</div>`
       }
     </section>
   `;
@@ -1129,19 +1004,19 @@ async function buildSectionView(sectionKey, state) {
     case "overview":
       return {
         pageTitle: "نظرة عامة",
-        pageDescription: "ملخص لحالة البوت، وقت النشر، وعدد المنشورات المبرمجة والمنشورة.",
+        pageDescription: "ملخص لحالة البوت، وقت نشر صورة السوق، وآخر النتائج.",
         body: await buildOverviewBody(state)
       };
     case "timing":
       return {
         pageTitle: "التحكم في الوقت",
-        pageDescription: "تغيير الفاصل الزمني بين المنشورات وتشغيل أو إيقاف الجدولة.",
+        pageDescription: "هذا الإصدار ينشر صورة السوق كل 8 ساعات، ويفحص تعليقات آخر منشور كل دقيقة.",
         body: buildTimingBody(state)
       };
     case "next-post":
       return {
         pageTitle: "المنشور التالي",
-        pageDescription: "يعرض أول منشور في طابور النشر كما هو.",
+        pageDescription: "يعرض الصورة الحالية والنص الذي سينشره البوت في الدورة القادمة.",
         body: buildNextPostBody(state)
       };
     case "posts":
@@ -1159,7 +1034,7 @@ async function buildSectionView(sectionKey, state) {
     case "content":
       return {
         pageTitle: "إدارة المنشورات",
-        pageDescription: "ألصق نصًا كبيرًا، وكل جزء بين @ و @ سيتم إضافته كمنشور مستقل قابل للحذف.",
+        pageDescription: "ارفع صورة واحدة وسيعيد البوت نشرها كل 8 ساعات مع ترقيم السوق تلقائيًا.",
         body: buildContentBody(state)
       };
     default:
@@ -1249,25 +1124,8 @@ app.get("/dashboard/:section", ensureDashboardAuth, async (req, res) => {
 });
 
 app.post("/dashboard/timing", ensureDashboardAuth, (req, res) => {
-  const intervalMinutes = Number.parseInt(String(req.body.intervalMinutes || ""), 10);
-  const enabled = req.body.scheduleEnabled === "on";
-
-  if (!Number.isInteger(intervalMinutes) || intervalMinutes < 1 || intervalMinutes > 1440) {
-    redirectWithMessage(res, "/dashboard/timing", {
-      error: "وقت النشر يجب أن يكون رقمًا بين 1 و 1440 دقيقة."
-    });
-    return;
-  }
-
-  updateState((current) => {
-    current.scheduler.intervalMinutes = intervalMinutes;
-    current.scheduler.enabled = enabled;
-    return current;
-  });
-
-  syncScheduler();
   redirectWithMessage(res, "/dashboard/timing", {
-    notice: enabled ? `تم حفظ الوقت على كل ${intervalMinutes} دقيقة.` : "تم إيقاف الجدولة."
+    notice: "توقيت هذا الإصدار ثابت: نشر كل 8 ساعات وفحص التعليقات كل دقيقة."
   });
 });
 
@@ -1289,7 +1147,7 @@ app.post("/dashboard/bot-toggle", ensureDashboardAuth, (req, res) => {
     syncScheduler();
 
     if (nextState.bot.active) {
-      void ensureQueueRefill("bot-start");
+      void maybeRunStartupPost();
     }
 
     if (wantsJson) {
@@ -1316,117 +1174,47 @@ app.post("/dashboard/bot-toggle", ensureDashboardAuth, (req, res) => {
   }
 });
 
-app.post("/dashboard/content", ensureDashboardAuth, async (req, res) => {
-  const bulkText = String(req.body.bulkText || "");
-  const posts = parseQueuedPosts(bulkText);
-  const wantsJson = (req.headers.accept || "").includes("application/json");
-
-  if (!posts.length) {
-    if (wantsJson) {
-      res.status(400).json({
-        ok: false,
-        error: "لم يتم العثور على منشورات بين الرمز @ والرمز @."
-      });
-      return;
-    }
-
+app.post("/dashboard/content/image", ensureDashboardAuth, upload.single("marketImage"), async (req, res) => {
+  if (!req.file) {
     redirectWithMessage(res, "/dashboard/content", {
-      error: "لم يتم العثور على منشورات بين الرمز @ والرمز @."
+      error: "اختر صورة أولًا قبل الرفع."
     });
     return;
   }
 
   try {
-    const nextState = await addPostsToQueue(posts);
+    const extension = path.extname(req.file.originalname || "") || ".jpg";
+    const finalFilename = `market-image${extension.toLowerCase()}`;
+    const finalPath = path.join(config.uploadsDir, finalFilename);
 
-    if (wantsJson) {
-      res.json({
-        ok: true,
-        message: `تمت إضافة ${posts.length} منشور(ات) إلى الطابور.`,
-        queueHtml: renderQueuedPostsList(getQueuedPosts(nextState))
-      });
-      return;
+    for (const filename of fs.readdirSync(config.uploadsDir)) {
+      if (filename.startsWith("market-image")) {
+        try {
+          fs.unlinkSync(path.join(config.uploadsDir, filename));
+        } catch {}
+      }
     }
 
-    redirectWithMessage(res, "/dashboard/content", {
-      notice: `تمت إضافة ${posts.length} منشور(ات) إلى الطابور.`
-    });
-  } catch (error) {
-    const message = `تعذر حفظ المنشورات: ${normalizeErrorMessage(error)}`;
-
-    if (wantsJson) {
-      res.status(500).json({ ok: false, error: message });
-      return;
-    }
-
-    redirectWithMessage(res, "/dashboard/content", { error: message });
-  }
-});
-
-app.post("/dashboard/content/ai", ensureDashboardAuth, async (req, res) => {
-  const wantsJson = (req.headers.accept || "").includes("application/json");
-  const aiPrompt = String(req.body.aiPrompt || "").trim();
-  const aiCount = Math.min(
-    50,
-    Math.max(1, Number.parseInt(String(req.body.aiCount || String(config.postsPerBatch)), 10) || config.postsPerBatch)
-  );
-
-  try {
-    const state = readState();
-    const existingPosts = [
-      ...getQueuedPosts(state).map((post) => post.text),
-      ...state.posts.slice(-8).map((post) => post.message)
-    ];
-    const generatedPosts = await generatePostsWithDeepSeek({
-      prompt: aiPrompt || config.topic,
-      count: aiCount,
-      existingPosts
-    });
-    const nextState = await addPostsToQueue(generatedPosts);
-
-    if (wantsJson) {
-      res.json({
-        ok: true,
-        message: `تم توليد ${generatedPosts.length} منشور(ات) وإضافتها إلى الطابور.`,
-        queueHtml: renderQueuedPostsList(getQueuedPosts(nextState))
-      });
-      return;
-    }
-
-    redirectWithMessage(res, "/dashboard/content", {
-      notice: `تم توليد ${generatedPosts.length} منشور(ات) وإضافتها إلى الطابور.`
-    });
-  } catch (error) {
-    const message = `تعذر توليد المنشورات: ${normalizeErrorMessage(error)}`;
-
-    if (wantsJson) {
-      res.status(500).json({ ok: false, error: message });
-      return;
-    }
-
-    redirectWithMessage(res, "/dashboard/content", { error: message });
-  }
-});
-
-app.post("/dashboard/content/delete/:id", ensureDashboardAuth, async (req, res) => {
-  const id = Number.parseInt(String(req.params.id || ""), 10);
-
-  try {
-    await deleteScheduledPost(id);
+    fs.renameSync(req.file.path, finalPath);
 
     updateState((current) => {
-      current.queuedPosts = current.queuedPosts.filter((post) => post.id !== id);
+      current.market.imageFilename = finalFilename;
+      current.market.imageOriginalName = req.file.originalname || finalFilename;
+      current.market.imageMimeType = req.file.mimetype || "image/jpeg";
+      current.scheduler.lastError = "";
       return current;
     });
 
     syncScheduler();
-
+    if (getBotState().active) {
+      void maybeRunStartupPost();
+    }
     redirectWithMessage(res, "/dashboard/content", {
-      notice: `تم حذف المنشور رقم ${id}.`
+      notice: "تم رفع صورة البوت بنجاح."
     });
   } catch (error) {
     redirectWithMessage(res, "/dashboard/content", {
-      error: `تعذر حذف المنشور من قاعدة البيانات: ${normalizeErrorMessage(error)}`
+      error: `تعذر رفع الصورة: ${normalizeErrorMessage(error)}`
     });
   }
 });
@@ -1446,6 +1234,7 @@ app.get("/health", (req, res) => {
 app.get("/status", ensureDashboardAuth, (req, res) => {
   const state = readState();
   const connection = getResolvedPageConnection(state);
+  const market = getMarketState(state);
   res.json({
     ok: true,
     baseUrl: config.baseUrl,
@@ -1463,8 +1252,9 @@ app.get("/status", ensureDashboardAuth, (req, res) => {
           mode: connection.mode
         }
       : null,
-    queuedPosts: getQueuedPosts(state),
-    nextPost: getNextQueuedPost(state),
+    market,
+    nextCaption: getNextMarketCaption(state),
+    imageUrl: getMarketImageUrl(state),
     missingEnv: getMissingCoreConfig(),
     lastRunAt: state.scheduler.lastRunAt,
     lastResult: state.scheduler.lastResult,
@@ -1536,30 +1326,27 @@ async function maybeRunStartupPost() {
   let state = readState();
   let schedule = getScheduleSettings(state);
   let bot = getBotState(state);
+  let market = getMarketState(state);
 
   if (!hasDirectPageAccessToken() || !bot.active || !schedule.enabled || getMissingCoreConfig().length) {
     return;
   }
 
-  await ensureQueueRefill("startup");
-  state = readState();
-  schedule = getScheduleSettings(state);
-  bot = getBotState(state);
+  if (!market.imageFilename) {
+    return;
+  }
 
   const lastRunAt = state.scheduler.lastRunAt ? new Date(state.scheduler.lastRunAt).getTime() : 0;
   const minDelayMs = schedule.intervalMinutes * 60 * 1000;
 
   if (lastRunAt && Number.isFinite(lastRunAt) && Date.now() - lastRunAt < minDelayMs) {
-    return;
-  }
-
-  if (!getNextQueuedPost(state)) {
+    startCommentMonitor();
     return;
   }
 
   try {
     await runPostingJob();
-    console.log("[startup] initial queued post published");
+    console.log("[startup] initial market post published");
   } catch (error) {
     updateState((current) => {
       current.scheduler.lastRunAt = new Date().toISOString();
@@ -1600,6 +1387,13 @@ app.listen(config.port, async () => {
           current.queuedPosts = snapshot.queuedPosts;
           current.posts = snapshot.posts;
           current.queueCounter = Math.max(current.queueCounter, snapshot.queueCounter);
+          const latestPost = snapshot.posts[snapshot.posts.length - 1];
+          const inferredNumber = latestPost ? extractMarketNumberFromMessage(latestPost.message) : 0;
+          if (inferredNumber && !current.market.lastPublishedNumber) {
+            current.market.lastPublishedNumber = inferredNumber;
+            current.market.nextNumber = Math.max(current.market.nextNumber || 1, inferredNumber + 1);
+            current.market.lastPublishedPostId = latestPost.id || current.market.lastPublishedPostId;
+          }
           return current;
         });
       }

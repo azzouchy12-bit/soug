@@ -10,7 +10,7 @@ let nextRunAt = "";
 
 function clearCurrentTimer() {
   if (currentTimer) {
-    clearTimeout(currentTimer);
+    clearInterval(currentTimer);
     currentTimer = null;
   }
 }
