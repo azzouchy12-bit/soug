@@ -137,59 +137,6 @@ async function graphMultipartRequest(pathname, { query = {}, fields = {} } = {})
   return payload;
 }
 
-export function getFacebookLoginUrl(baseUrl = config.baseUrl) {
-  const url = new URL(`https://www.facebook.com/${graphVersion}/dialog/oauth`);
-  url.searchParams.set("client_id", config.facebookAppId);
-  url.searchParams.set("redirect_uri", `${baseUrl}/auth/facebook/callback`);
-  url.searchParams.set(
-    "scope",
-    [
-      "pages_manage_posts",
-      "pages_read_engagement",
-      "pages_show_list",
-      "pages_manage_engagement",
-      "pages_read_user_engagement"
-    ].join(",")
-  );
-  url.searchParams.set("response_type", "code");
-  return url.toString();
-}
-
-export async function exchangeCodeForLongLivedUserToken(code, baseUrl = config.baseUrl) {
-  const redirectUri = `${baseUrl}/auth/facebook/callback`;
-
-  const shortLived = await graphRequest("/oauth/access_token", {
-    query: {
-      client_id: config.facebookAppId,
-      client_secret: config.facebookAppSecret,
-      redirect_uri: redirectUri,
-      code
-    }
-  });
-
-  const longLived = await graphRequest("/oauth/access_token", {
-    query: {
-      grant_type: "fb_exchange_token",
-      client_id: config.facebookAppId,
-      client_secret: config.facebookAppSecret,
-      fb_exchange_token: shortLived.access_token
-    }
-  });
-
-  return longLived.access_token;
-}
-
-export async function getManagedPages(userAccessToken) {
-  const response = await graphRequest("/me/accounts", {
-    query: {
-      access_token: userAccessToken,
-      fields: "id,name,access_token,tasks"
-    }
-  });
-
-  return response.data || [];
-}
-
 export async function publishPagePost({ pageId, pageAccessToken, message }) {
   const safePageId = requireGraphId(pageId, "pageId");
   const accessToken = requireAccessToken(pageAccessToken, "publishPagePost");

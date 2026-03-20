@@ -3,15 +3,10 @@ import { config } from "./config.js";
 
 const defaultState = {
   facebook: {
-    userAccessToken: "",
-    pageAccessToken: "",
     pageId: "",
     pageName: "",
-    pages: [],
-    lastAuthAt: ""
+    lastProfileSyncAt: ""
   },
-  queuedPosts: [],
-  queueCounter: 0,
   posts: [],
   market: {
     imageFilename: "",
@@ -56,8 +51,6 @@ export function readState() {
         ...structuredClone(defaultState.facebook),
         ...(parsed.facebook || {})
       },
-      queuedPosts: Array.isArray(parsed.queuedPosts) ? parsed.queuedPosts : [],
-      queueCounter: Number.isInteger(parsed.queueCounter) ? parsed.queueCounter : 0,
       posts: Array.isArray(parsed.posts) ? parsed.posts : [],
       market: {
         ...structuredClone(defaultState.market),

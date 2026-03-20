@@ -67,8 +67,6 @@ export const config = {
   repeatCommentReplyDelayMs: 30_000,
   commentActionGapMs: 3_000,
   databaseUrl: readEnv("DATABASE_URL"),
-  facebookAppId: readEnv("FB_APP_ID"),
-  facebookAppSecret: readEnv("FB_APP_SECRET"),
   facebookGraphApiVersion: readEnv("FB_GRAPH_API_VERSION", "v25.0"),
   facebookPageId: readEnv("FB_PAGE_ID"),
   facebookPageAccessToken: readTokenEnv("FB_PAGE_ACCESS_TOKEN"),
@@ -87,13 +85,7 @@ export function getMissingCoreConfig() {
   }
 
   if (!config.facebookPageAccessToken) {
-    if (!config.facebookAppId) {
-      missing.push("FB_APP_ID");
-    }
-
-    if (!config.facebookAppSecret) {
-      missing.push("FB_APP_SECRET");
-    }
+    missing.push("FB_PAGE_ACCESS_TOKEN");
   }
 
   return missing;

@@ -9,18 +9,19 @@ import {
   ensureDatabaseSeededFromState,
   initDatabase,
   isDatabaseConfigured,
-  listCommentLikes,
-  listCommentReplies,
+  listLikedComments,
+  listPendingCommentLikes,
+  listPendingCommentReplies,
+  listRepliedComments,
   loadDatabaseSnapshot,
   markCommentLikeHandled,
   markCommentReplyHandled,
+  setPendingCommentLikeError,
+  setPendingCommentReplyError,
   moveScheduledPostToPublished,
   upsertScheduledMarketPost
 } from "./database.js";
 import {
-  exchangeCodeForLongLivedUserToken,
-  getFacebookLoginUrl,
-  getManagedPages,
   getPageProfile,
   getPostComments,
   getPostDetails,
@@ -100,7 +101,7 @@ function buildCookie(name, value, options = {}) {
 }
 
 function getDashboardSessionToken() {
-  const seed = config.facebookAppSecret || config.facebookPageAccessToken || config.baseUrl;
+  const seed = config.facebookPageAccessToken || config.baseUrl;
   return crypto.createHash("sha256").update(`${config.dashboardAccessCode}:${seed}`).digest("hex");
 }
 
@@ -240,29 +241,18 @@ function getNextMarketCaption(state = readState()) {
 }
 
 function hasDirectPageAccessToken() {
-  return Boolean(config.facebookPageAccessToken);
+  return Boolean(String(config.facebookPageAccessToken || "").trim());
 }
 
 function getResolvedPageConnection(state = readState()) {
-  if (hasDirectPageAccessToken()) {
-    return {
-      pageId: config.facebookPageId,
-      pageAccessToken: config.facebookPageAccessToken,
-      pageName:
-        state.facebook.pageId === config.facebookPageId && state.facebook.pageName
-          ? state.facebook.pageName
-          : "صفحتي على فيسبوك",
-      mode: "direct"
-    };
-  }
-
-  const hasMatchingPageToken = state.facebook.pageId === config.facebookPageId;
-
   return {
     pageId: config.facebookPageId,
-    pageAccessToken: hasMatchingPageToken ? state.facebook.pageAccessToken : "",
-    pageName: hasMatchingPageToken ? state.facebook.pageName || "صفحتي على فيسبوك" : "صفحتي على فيسبوك",
-    mode: "oauth"
+    pageAccessToken: config.facebookPageAccessToken,
+    pageName:
+      state.facebook.pageId === config.facebookPageId && state.facebook.pageName
+        ? state.facebook.pageName
+        : "صفحتي على فيسبوك",
+    mode: "direct"
   };
 }
 
@@ -559,15 +549,18 @@ function isIgnorableLikeError(error) {
 }
 
 async function likeThenReplyComment({ commentId, pageAccessToken, replyText }) {
+  let likeSucceeded = false;
   try {
     await likeComment({
       commentId,
       pageAccessToken
     });
+    likeSucceeded = true;
   } catch (error) {
     if (!isIgnorableLikeError(error)) {
       throw error;
     }
+    likeSucceeded = true;
   }
 
   await delay(config.commentActionGapMs);
@@ -592,8 +585,11 @@ async function likeThenReplyComment({ commentId, pageAccessToken, replyText }) {
   }
 
   if (replyError) {
+    replyError.likeSucceeded = likeSucceeded;
     throw replyError;
   }
+
+  return { likeSucceeded: true, replySucceeded: true };
 }
 
 function extractMarketNumberFromMessage(message) {
@@ -658,8 +654,24 @@ async function checkLatestPostComments() {
       return;
     }
 
-    if (currentMarket.repliedComments?.[commentId] || processingCommentIds.has(commentId)) {
+    const localReplyState = currentMarket.repliedComments?.[commentId];
+    if (localReplyState && localReplyState !== "__processing__") {
       continue;
+    }
+
+    if (processingCommentIds.has(commentId)) {
+      continue;
+    }
+
+    if (localReplyState === "__processing__") {
+      updateState((current) => {
+        const nextReplies = { ...(current.market.repliedComments || {}) };
+        if (nextReplies[commentId] === "__processing__") {
+          delete nextReplies[commentId];
+          current.market.repliedComments = nextReplies;
+        }
+        return current;
+      });
     }
 
     if (comment.from?.id && comment.from.id === connection.pageId) {
@@ -704,14 +716,16 @@ async function checkLatestPostComments() {
         commentMessage: comment.message || ""
       });
 
-      await likeThenReplyComment({
+      const actionResult = await likeThenReplyComment({
         commentId,
         pageAccessToken: connection.pageAccessToken,
         replyText
       });
 
+      if (actionResult.likeSucceeded) {
+        await markCommentLikeHandled(commentId);
+      }
       await markCommentReplyHandled(commentId);
-      await markCommentLikeHandled(commentId);
 
       updateState((current) => {
         current.market.activeCommentCount = nextCommentNumber;
@@ -728,13 +742,23 @@ async function checkLatestPostComments() {
         return current;
       });
     } catch (error) {
+      const errorMessage = normalizeErrorMessage(error);
+      try {
+        if (error.likeSucceeded) {
+          await markCommentLikeHandled(commentId);
+        } else {
+          await setPendingCommentLikeError(commentId, errorMessage);
+        }
+        await setPendingCommentReplyError(commentId, errorMessage);
+      } catch {}
+
       updateState((current) => {
         if (current.market.repliedComments?.[commentId] === "__processing__") {
           const nextReplies = { ...(current.market.repliedComments || {}) };
           delete nextReplies[commentId];
           current.market.repliedComments = nextReplies;
         }
-        current.scheduler.lastError = normalizeErrorMessage(error);
+        current.scheduler.lastError = errorMessage;
         return current;
       });
       throw error;
@@ -778,9 +802,7 @@ async function runPostingJob() {
     const snapshot = await loadDatabaseSnapshot();
     if (snapshot) {
       state = updateState((current) => {
-        current.queuedPosts = snapshot.queuedPosts;
         current.posts = snapshot.posts;
-        current.queueCounter = Math.max(current.queueCounter, snapshot.queueCounter);
         return current;
       });
     }
@@ -1229,6 +1251,10 @@ function buildCommentActionItems(rows, type) {
       details.push(`رقم التعليق: ${escapeHtml(row.comment_number)}`);
     }
 
+    if (type === "pending" && row.last_error) {
+      details.push(`آخر خطأ: ${escapeHtml(row.last_error)}`);
+    }
+
     const text =
       row.reply_message
         ? `التعليق:\n${commentText}\n\nالرد:\n${row.reply_message}`
@@ -1242,7 +1268,7 @@ function buildCommentActionItems(rows, type) {
 }
 
 async function buildRepliedCommentsBody() {
-  const rows = isDatabaseConfigured() ? await listCommentReplies({ status: "handled", limit: 80 }) : [];
+  const rows = isDatabaseConfigured() ? await listRepliedComments(80) : [];
   return `
     <section class="section">
       <h2>${icons.status}<span>التعليقات التي تم الرد عليها</span></h2>
@@ -1252,7 +1278,7 @@ async function buildRepliedCommentsBody() {
 }
 
 async function buildLikedCommentsBody() {
-  const rows = isDatabaseConfigured() ? await listCommentLikes({ status: "handled", limit: 80 }) : [];
+  const rows = isDatabaseConfigured() ? await listLikedComments(80) : [];
   return `
     <section class="section">
       <h2>${icons.people}<span>التعليقات التي تم الإعجاب بها</span></h2>
@@ -1262,7 +1288,7 @@ async function buildLikedCommentsBody() {
 }
 
 async function buildQueuedRepliesBody() {
-  const rows = isDatabaseConfigured() ? await listCommentReplies({ status: "pending", limit: 80 }) : [];
+  const rows = isDatabaseConfigured() ? await listPendingCommentReplies(80) : [];
   return `
     <section class="section">
       <h2>${icons.edit}<span>التعليقات المجدولة للرد عليها</span></h2>
@@ -1272,7 +1298,7 @@ async function buildQueuedRepliesBody() {
 }
 
 async function buildQueuedLikesBody() {
-  const rows = isDatabaseConfigured() ? await listCommentLikes({ status: "pending", limit: 80 }) : [];
+  const rows = isDatabaseConfigured() ? await listPendingCommentLikes(80) : [];
   return `
     <section class="section">
       <h2>${icons.spark}<span>التعليقات المجدولة للإعجاب لها</span></h2>
@@ -1373,8 +1399,6 @@ async function renderSection(req, res, sectionKey) {
     })
   );
 }
-
-syncScheduler();
 
 app.get("/", (req, res) => {
   if (isDashboardAuthenticated(req)) {
@@ -1594,65 +1618,6 @@ app.get("/status", ensureDashboardAuth, (req, res) => {
   });
 });
 
-app.get("/auth/facebook/start", ensureDashboardAuth, (req, res) => {
-  if (hasDirectPageAccessToken()) {
-    redirectWithMessage(res, "/dashboard/overview", {
-      notice: "الوضع المباشر مفعل بالفعل عبر FB_PAGE_ACCESS_TOKEN."
-    });
-    return;
-  }
-
-  const missing = getMissingCoreConfig();
-  if (missing.length) {
-    res.status(400).send(`Missing env values: ${missing.join(", ")}`);
-    return;
-  }
-
-  res.redirect(getFacebookLoginUrl(config.baseUrl));
-});
-
-app.get("/auth/facebook/callback", ensureDashboardAuth, async (req, res) => {
-  if (hasDirectPageAccessToken()) {
-    redirectWithMessage(res, "/dashboard/overview", {
-      notice: "تم تجاوز Facebook Login لأن FB_PAGE_ACCESS_TOKEN مفعل."
-    });
-    return;
-  }
-
-  try {
-    const code = String(req.query.code || "");
-    if (!code) {
-      throw new Error("Facebook did not return an authorization code.");
-    }
-
-    const userAccessToken = await exchangeCodeForLongLivedUserToken(code, config.baseUrl);
-    const pages = await getManagedPages(userAccessToken);
-    const matchingPage = pages.find((page) => page.id === config.facebookPageId);
-
-    if (!matchingPage) {
-      throw new Error(`The configured FB_PAGE_ID (${config.facebookPageId}) is not managed by this Facebook account.`);
-    }
-
-    updateState((current) => {
-      current.facebook.userAccessToken = userAccessToken;
-      current.facebook.pages = [matchingPage];
-      current.facebook.lastAuthAt = new Date().toISOString();
-      current.facebook.pageId = matchingPage.id;
-      current.facebook.pageName = matchingPage.name;
-      current.facebook.pageAccessToken = matchingPage.access_token;
-      return current;
-    });
-
-    redirectWithMessage(res, "/dashboard/overview", {
-      notice: `تم ربط صفحة ${matchingPage.name} بنجاح.`
-    });
-  } catch (error) {
-    redirectWithMessage(res, "/dashboard/overview", {
-      error: normalizeErrorMessage(error)
-    });
-  }
-});
-
 async function maybeRunStartupPost() {
   let state = readState();
   let schedule = getScheduleSettings(state);
@@ -1715,9 +1680,7 @@ app.listen(config.port, async () => {
 
       if (snapshot) {
         updateState((current) => {
-          current.queuedPosts = snapshot.queuedPosts;
           current.posts = snapshot.posts;
-          current.queueCounter = Math.max(current.queueCounter, snapshot.queueCounter);
           const latestPost = snapshot.posts[snapshot.posts.length - 1];
           const inferredNumber = latestPost ? extractMarketNumberFromMessage(latestPost.message) : 0;
           if (inferredNumber && !current.market.lastPublishedNumber) {
@@ -1735,11 +1698,13 @@ app.listen(config.port, async () => {
 
       console.log("Postgres storage enabled");
       await syncScheduledMarketPostRecord(readState());
-      syncScheduler();
     } catch (error) {
       console.error("[database] failed:", normalizeErrorMessage(error));
     }
   }
+
+  syncScheduler();
+
   if (hasDirectPageAccessToken()) {
     await refreshDirectPageProfile();
     console.log(`Direct page token mode enabled for page ${config.facebookPageId}`);

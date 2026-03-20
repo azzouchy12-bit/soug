@@ -2,6 +2,7 @@ import { Pool } from "pg";
 import { config } from "./config.js";
 
 let pool = null;
+const SCHEMA_VERSION = "3";
 
 function getPool() {
   if (!config.databaseUrl) {
@@ -21,39 +22,47 @@ export function isDatabaseConfigured() {
   return Boolean(config.databaseUrl);
 }
 
-export async function initDatabase() {
-  const db = getPool();
-  if (!db) {
-    return false;
-  }
+async function createFreshSchema(client) {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS schema_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+  `);
 
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS scheduled_posts (
+  await client.query("DROP TABLE IF EXISTS liked_comments;");
+  await client.query("DROP TABLE IF EXISTS pending_comment_likes;");
+  await client.query("DROP TABLE IF EXISTS replied_comments;");
+  await client.query("DROP TABLE IF EXISTS pending_comment_replies;");
+  await client.query("DROP TABLE IF EXISTS published_posts;");
+  await client.query("DROP TABLE IF EXISTS scheduled_posts;");
+  await client.query("DROP TABLE IF EXISTS comment_like_queue;");
+  await client.query("DROP TABLE IF EXISTS comment_reply_queue;");
+
+  await client.query(`
+    CREATE TABLE scheduled_posts (
       id BIGINT PRIMARY KEY,
       message TEXT NOT NULL,
+      scheduled_for TIMESTAMPTZ,
+      image_filename TEXT,
+      market_number INT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
-  await db.query(`ALTER TABLE scheduled_posts ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMPTZ;`);
-  await db.query(`ALTER TABLE scheduled_posts ADD COLUMN IF NOT EXISTS image_filename TEXT;`);
-  await db.query(`ALTER TABLE scheduled_posts ADD COLUMN IF NOT EXISTS market_number INT;`);
-  await db.query(`ALTER TABLE scheduled_posts ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'scheduled';`);
-
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS published_posts (
+  await client.query(`
+    CREATE TABLE published_posts (
       id TEXT PRIMARY KEY,
       queue_id BIGINT,
       message TEXT NOT NULL,
+      image_filename TEXT,
+      market_number INT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
-  await db.query(`ALTER TABLE published_posts ADD COLUMN IF NOT EXISTS image_filename TEXT;`);
-  await db.query(`ALTER TABLE published_posts ADD COLUMN IF NOT EXISTS market_number INT;`);
-
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS comment_reply_queue (
+  await client.query(`
+    CREATE TABLE pending_comment_replies (
       comment_id TEXT PRIMARY KEY,
       post_id TEXT NOT NULL,
       author_id TEXT,
@@ -62,26 +71,94 @@ export async function initDatabase() {
       reply_message TEXT NOT NULL,
       market_number INT,
       comment_number INT,
-      status TEXT NOT NULL DEFAULT 'pending',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      handled_at TIMESTAMPTZ
+      last_error TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS comment_like_queue (
+  await client.query(`
+    CREATE TABLE replied_comments (
       comment_id TEXT PRIMARY KEY,
       post_id TEXT NOT NULL,
       author_id TEXT,
       author_name TEXT,
       comment_message TEXT,
-      status TEXT NOT NULL DEFAULT 'pending',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      handled_at TIMESTAMPTZ
+      reply_message TEXT NOT NULL,
+      market_number INT,
+      comment_number INT,
+      queued_at TIMESTAMPTZ,
+      handled_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
-  return true;
+  await client.query(`
+    CREATE TABLE pending_comment_likes (
+      comment_id TEXT PRIMARY KEY,
+      post_id TEXT NOT NULL,
+      author_id TEXT,
+      author_name TEXT,
+      comment_message TEXT,
+      last_error TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await client.query(`
+    CREATE TABLE liked_comments (
+      comment_id TEXT PRIMARY KEY,
+      post_id TEXT NOT NULL,
+      author_id TEXT,
+      author_name TEXT,
+      comment_message TEXT,
+      queued_at TIMESTAMPTZ,
+      handled_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await client.query(
+    `
+      INSERT INTO schema_meta (key, value)
+      VALUES ('schema_version', $1)
+      ON CONFLICT (key) DO UPDATE
+      SET value = EXCLUDED.value
+    `,
+    [SCHEMA_VERSION]
+  );
+}
+
+export async function initDatabase() {
+  const db = getPool();
+  if (!db) {
+    return false;
+  }
+
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS schema_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+    `);
+
+    const versionResult = await client.query(
+      "SELECT value FROM schema_meta WHERE key = 'schema_version' LIMIT 1"
+    );
+    const currentVersion = versionResult.rows[0]?.value || "";
+
+    if (currentVersion !== SCHEMA_VERSION) {
+      await createFreshSchema(client);
+    }
+
+    await client.query("COMMIT");
+    return true;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export async function ensureDatabaseSeededFromState(state) {
@@ -101,33 +178,31 @@ export async function ensureDatabaseSeededFromState(state) {
     return false;
   }
 
-  const client = await db.connect();
+  const posts = Array.isArray(state.posts) ? state.posts : [];
+  if (!posts.length) {
+    return false;
+  }
 
+  const client = await db.connect();
   try {
     await client.query("BEGIN");
-
-    for (const post of state.queuedPosts || []) {
+    for (const post of posts) {
       await client.query(
         `
-          INSERT INTO scheduled_posts (id, message, created_at)
-          VALUES ($1, $2, $3)
+          INSERT INTO published_posts (id, queue_id, message, image_filename, market_number, created_at)
+          VALUES ($1, $2, $3, $4, $5, $6)
           ON CONFLICT (id) DO NOTHING
         `,
-        [post.id, post.text, post.createdAt || new Date().toISOString()]
+        [
+          post.id,
+          post.queueId || null,
+          post.message || "",
+          post.imageFilename || null,
+          post.marketNumber || null,
+          post.createdAt || new Date().toISOString()
+        ]
       );
     }
-
-    for (const post of state.posts || []) {
-      await client.query(
-        `
-          INSERT INTO published_posts (id, queue_id, message, created_at)
-          VALUES ($1, $2, $3, $4)
-          ON CONFLICT (id) DO NOTHING
-        `,
-        [post.id, post.queueId || null, post.message || "", post.createdAt || new Date().toISOString()]
-      );
-    }
-
     await client.query("COMMIT");
     return true;
   } catch (error) {
@@ -146,20 +221,25 @@ export async function loadDatabaseSnapshot() {
 
   const [scheduledResult, publishedResult] = await Promise.all([
     db.query(`
-      SELECT id, message, created_at
+      SELECT id, message, scheduled_for, image_filename, market_number, created_at
       FROM scheduled_posts
-      ORDER BY id ASC
+      ORDER BY scheduled_for ASC NULLS LAST, id ASC
+      LIMIT 50
     `),
     db.query(`
-      SELECT id, queue_id, message, created_at
+      SELECT id, queue_id, message, image_filename, market_number, created_at
       FROM published_posts
       ORDER BY created_at ASC, id ASC
+      LIMIT 500
     `)
   ]);
 
-  const queuedPosts = scheduledResult.rows.map((row) => ({
+  const scheduledPosts = scheduledResult.rows.map((row) => ({
     id: Number(row.id),
-    text: row.message,
+    message: row.message,
+    scheduledFor: row.scheduled_for ? new Date(row.scheduled_for).toISOString() : "",
+    imageFilename: row.image_filename || "",
+    marketNumber: row.market_number || null,
     createdAt: new Date(row.created_at).toISOString()
   }));
 
@@ -167,59 +247,43 @@ export async function loadDatabaseSnapshot() {
     id: row.id,
     queueId: row.queue_id === null ? null : Number(row.queue_id),
     message: row.message,
+    imageFilename: row.image_filename || "",
+    marketNumber: row.market_number || null,
     createdAt: new Date(row.created_at).toISOString()
   }));
 
-  const maxScheduledId = queuedPosts.reduce((max, post) => Math.max(max, Number(post.id) || 0), 0);
-  const maxPublishedQueueId = posts.reduce((max, post) => Math.max(max, Number(post.queueId) || 0), 0);
-
   return {
-    queuedPosts,
-    posts,
-    queueCounter: Math.max(maxScheduledId, maxPublishedQueueId)
+    scheduledPosts,
+    posts
   };
 }
 
-export async function insertScheduledPosts(posts) {
-  const db = getPool();
-  if (!db || !posts.length) {
-    return;
-  }
-
-  const client = await db.connect();
-
-  try {
-    await client.query("BEGIN");
-
-    for (const post of posts) {
-      await client.query(
-        `
-          INSERT INTO scheduled_posts (id, message, created_at)
-          VALUES ($1, $2, $3)
-          ON CONFLICT (id) DO UPDATE
-          SET message = EXCLUDED.message,
-              created_at = EXCLUDED.created_at
-        `,
-        [post.id, post.text, post.createdAt || new Date().toISOString()]
-      );
-    }
-
-    await client.query("COMMIT");
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
-export async function deleteScheduledPost(postId) {
+export async function upsertScheduledMarketPost({
+  id,
+  message,
+  createdAt,
+  scheduledFor,
+  imageFilename,
+  marketNumber
+}) {
   const db = getPool();
   if (!db) {
     return;
   }
 
-  await db.query("DELETE FROM scheduled_posts WHERE id = $1", [postId]);
+  await db.query(
+    `
+      INSERT INTO scheduled_posts (id, message, scheduled_for, image_filename, market_number, created_at)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (id) DO UPDATE
+      SET message = EXCLUDED.message,
+          scheduled_for = EXCLUDED.scheduled_for,
+          image_filename = EXCLUDED.image_filename,
+          market_number = EXCLUDED.market_number,
+          created_at = EXCLUDED.created_at
+    `,
+    [id, message, scheduledFor || null, imageFilename || null, marketNumber || null, createdAt]
+  );
 }
 
 export async function moveScheduledPostToPublished({
@@ -236,31 +300,24 @@ export async function moveScheduledPostToPublished({
   }
 
   const client = await db.connect();
-
   try {
     await client.query("BEGIN");
     if (queueId !== null && queueId !== undefined) {
       await client.query("DELETE FROM scheduled_posts WHERE id = $1", [queueId]);
     }
+
     await client.query(
       `
-        INSERT INTO published_posts (id, queue_id, message, created_at, image_filename, market_number)
+        INSERT INTO published_posts (id, queue_id, message, image_filename, market_number, created_at)
         VALUES ($1, $2, $3, $4, $5, $6)
         ON CONFLICT (id) DO UPDATE
         SET queue_id = EXCLUDED.queue_id,
             message = EXCLUDED.message,
-            created_at = EXCLUDED.created_at,
             image_filename = EXCLUDED.image_filename,
-            market_number = EXCLUDED.market_number
+            market_number = EXCLUDED.market_number,
+            created_at = EXCLUDED.created_at
       `,
-      [
-        facebookPostId,
-        queueId,
-        message,
-        createdAt,
-        imageFilename || null,
-        marketNumber || null
-      ]
+      [facebookPostId, queueId, message, imageFilename || null, marketNumber || null, createdAt]
     );
     await client.query("COMMIT");
   } catch (error) {
@@ -269,28 +326,6 @@ export async function moveScheduledPostToPublished({
   } finally {
     client.release();
   }
-}
-
-export async function upsertScheduledMarketPost({ id, message, createdAt, scheduledFor, imageFilename, marketNumber }) {
-  const db = getPool();
-  if (!db) {
-    return;
-  }
-
-  await db.query(
-    `
-      INSERT INTO scheduled_posts (id, message, created_at, scheduled_for, image_filename, market_number, status)
-      VALUES ($1, $2, $3, $4, $5, $6, 'scheduled')
-      ON CONFLICT (id) DO UPDATE
-      SET message = EXCLUDED.message,
-          created_at = EXCLUDED.created_at,
-          scheduled_for = EXCLUDED.scheduled_for,
-          image_filename = EXCLUDED.image_filename,
-          market_number = EXCLUDED.market_number,
-          status = 'scheduled'
-    `,
-    [id, message, createdAt, scheduledFor, imageFilename || null, marketNumber || null]
-  );
 }
 
 export async function enqueueCommentReply({
@@ -305,44 +340,32 @@ export async function enqueueCommentReply({
 }) {
   const db = getPool();
   if (!db) {
-    return;
+    return false;
   }
 
-  await db.query(
+  const result = await db.query(
     `
-      INSERT INTO comment_reply_queue (
+      INSERT INTO pending_comment_replies (
         comment_id, post_id, author_id, author_name, comment_message,
-        reply_message, market_number, comment_number, status
+        reply_message, market_number, comment_number, last_error
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
-      ON CONFLICT (comment_id) DO UPDATE
-      SET post_id = EXCLUDED.post_id,
-          author_id = EXCLUDED.author_id,
-          author_name = EXCLUDED.author_name,
-          comment_message = EXCLUDED.comment_message,
-          reply_message = EXCLUDED.reply_message,
-          market_number = EXCLUDED.market_number,
-          comment_number = EXCLUDED.comment_number
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '')
+      ON CONFLICT (comment_id) DO NOTHING
+      RETURNING comment_id
     `,
-    [commentId, postId, authorId || null, authorName || null, commentMessage || "", replyMessage, marketNumber || null, commentNumber || null]
+    [
+      commentId,
+      postId,
+      authorId || null,
+      authorName || null,
+      commentMessage || "",
+      replyMessage,
+      marketNumber || null,
+      commentNumber || null
+    ]
   );
-}
 
-export async function markCommentReplyHandled(commentId) {
-  const db = getPool();
-  if (!db) {
-    return;
-  }
-
-  await db.query(
-    `
-      UPDATE comment_reply_queue
-      SET status = 'handled',
-          handled_at = NOW()
-      WHERE comment_id = $1
-    `,
-    [commentId]
-  );
+  return result.rowCount > 0;
 }
 
 export async function enqueueCommentLike({
@@ -354,22 +377,80 @@ export async function enqueueCommentLike({
 }) {
   const db = getPool();
   if (!db) {
+    return false;
+  }
+
+  const result = await db.query(
+    `
+      INSERT INTO pending_comment_likes (
+        comment_id, post_id, author_id, author_name, comment_message, last_error
+      )
+      VALUES ($1, $2, $3, $4, $5, '')
+      ON CONFLICT (comment_id) DO NOTHING
+      RETURNING comment_id
+    `,
+    [commentId, postId, authorId || null, authorName || null, commentMessage || ""]
+  );
+
+  return result.rowCount > 0;
+}
+
+export async function markCommentReplyHandled(commentId) {
+  const db = getPool();
+  if (!db) {
+    return;
+  }
+
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `
+        INSERT INTO replied_comments (
+          comment_id, post_id, author_id, author_name, comment_message,
+          reply_message, market_number, comment_number, queued_at, handled_at
+        )
+        SELECT
+          comment_id, post_id, author_id, author_name, comment_message,
+          reply_message, market_number, comment_number, created_at, NOW()
+        FROM pending_comment_replies
+        WHERE comment_id = $1
+        ON CONFLICT (comment_id) DO UPDATE
+        SET post_id = EXCLUDED.post_id,
+            author_id = EXCLUDED.author_id,
+            author_name = EXCLUDED.author_name,
+            comment_message = EXCLUDED.comment_message,
+            reply_message = EXCLUDED.reply_message,
+            market_number = EXCLUDED.market_number,
+            comment_number = EXCLUDED.comment_number,
+            queued_at = EXCLUDED.queued_at,
+            handled_at = EXCLUDED.handled_at
+      `,
+      [commentId]
+    );
+    await client.query("DELETE FROM pending_comment_replies WHERE comment_id = $1", [commentId]);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function setPendingCommentReplyError(commentId, errorMessage) {
+  const db = getPool();
+  if (!db) {
     return;
   }
 
   await db.query(
     `
-      INSERT INTO comment_like_queue (
-        comment_id, post_id, author_id, author_name, comment_message, status
-      )
-      VALUES ($1, $2, $3, $4, $5, 'pending')
-      ON CONFLICT (comment_id) DO UPDATE
-      SET post_id = EXCLUDED.post_id,
-          author_id = EXCLUDED.author_id,
-          author_name = EXCLUDED.author_name,
-          comment_message = EXCLUDED.comment_message
+      UPDATE pending_comment_replies
+      SET last_error = $2
+      WHERE comment_id = $1
     `,
-    [commentId, postId, authorId || null, authorName || null, commentMessage || ""]
+    [commentId, String(errorMessage || "").slice(0, 1500)]
   );
 }
 
@@ -379,89 +460,135 @@ export async function markCommentLikeHandled(commentId) {
     return;
   }
 
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `
+        INSERT INTO liked_comments (
+          comment_id, post_id, author_id, author_name, comment_message, queued_at, handled_at
+        )
+        SELECT
+          comment_id, post_id, author_id, author_name, comment_message, created_at, NOW()
+        FROM pending_comment_likes
+        WHERE comment_id = $1
+        ON CONFLICT (comment_id) DO UPDATE
+        SET post_id = EXCLUDED.post_id,
+            author_id = EXCLUDED.author_id,
+            author_name = EXCLUDED.author_name,
+            comment_message = EXCLUDED.comment_message,
+            queued_at = EXCLUDED.queued_at,
+            handled_at = EXCLUDED.handled_at
+      `,
+      [commentId]
+    );
+    await client.query("DELETE FROM pending_comment_likes WHERE comment_id = $1", [commentId]);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function setPendingCommentLikeError(commentId, errorMessage) {
+  const db = getPool();
+  if (!db) {
+    return;
+  }
+
   await db.query(
     `
-      UPDATE comment_like_queue
-      SET status = 'handled',
-          handled_at = NOW()
+      UPDATE pending_comment_likes
+      SET last_error = $2
       WHERE comment_id = $1
     `,
-    [commentId]
+    [commentId, String(errorMessage || "").slice(0, 1500)]
   );
 }
 
-export async function listCommentReplies({ status, limit = 50 } = {}) {
+export async function listPendingCommentReplies(limit = 80) {
   const db = getPool();
   if (!db) {
     return [];
   }
 
-  const values = [];
-  let where = "";
-  if (status) {
-    values.push(status);
-    where = `WHERE status = $${values.length}`;
-  }
-
-  values.push(Math.max(1, Number(limit || 50)));
-
+  const safeLimit = Math.max(1, Number(limit || 80));
   const result = await db.query(
     `
       SELECT
-        comment_id,
-        post_id,
-        author_id,
-        author_name,
-        comment_message,
-        reply_message,
-        market_number,
-        comment_number,
-        status,
-        created_at,
-        handled_at
-      FROM comment_reply_queue
-      ${where}
-      ORDER BY COALESCE(handled_at, created_at) DESC, created_at DESC
-      LIMIT $${values.length}
+        comment_id, post_id, author_id, author_name, comment_message,
+        reply_message, market_number, comment_number, last_error, created_at
+      FROM pending_comment_replies
+      ORDER BY created_at DESC
+      LIMIT $1
     `,
-    values
+    [safeLimit]
   );
 
   return result.rows;
 }
 
-export async function listCommentLikes({ status, limit = 50 } = {}) {
+export async function listRepliedComments(limit = 80) {
   const db = getPool();
   if (!db) {
     return [];
   }
 
-  const values = [];
-  let where = "";
-  if (status) {
-    values.push(status);
-    where = `WHERE status = $${values.length}`;
-  }
-
-  values.push(Math.max(1, Number(limit || 50)));
-
+  const safeLimit = Math.max(1, Number(limit || 80));
   const result = await db.query(
     `
       SELECT
-        comment_id,
-        post_id,
-        author_id,
-        author_name,
-        comment_message,
-        status,
-        created_at,
-        handled_at
-      FROM comment_like_queue
-      ${where}
-      ORDER BY COALESCE(handled_at, created_at) DESC, created_at DESC
-      LIMIT $${values.length}
+        comment_id, post_id, author_id, author_name, comment_message,
+        reply_message, market_number, comment_number, queued_at, handled_at
+      FROM replied_comments
+      ORDER BY handled_at DESC
+      LIMIT $1
     `,
-    values
+    [safeLimit]
+  );
+
+  return result.rows;
+}
+
+export async function listPendingCommentLikes(limit = 80) {
+  const db = getPool();
+  if (!db) {
+    return [];
+  }
+
+  const safeLimit = Math.max(1, Number(limit || 80));
+  const result = await db.query(
+    `
+      SELECT
+        comment_id, post_id, author_id, author_name, comment_message, last_error, created_at
+      FROM pending_comment_likes
+      ORDER BY created_at DESC
+      LIMIT $1
+    `,
+    [safeLimit]
+  );
+
+  return result.rows;
+}
+
+export async function listLikedComments(limit = 80) {
+  const db = getPool();
+  if (!db) {
+    return [];
+  }
+
+  const safeLimit = Math.max(1, Number(limit || 80));
+  const result = await db.query(
+    `
+      SELECT
+        comment_id, post_id, author_id, author_name, comment_message, queued_at, handled_at
+      FROM liked_comments
+      ORDER BY handled_at DESC
+      LIMIT $1
+    `,
+    [safeLimit]
   );
 
   return result.rows;

@@ -50,7 +50,7 @@ export function startScheduler(job, options = {}) {
   currentJob = job;
   stopScheduler();
 
-  const interval = Math.max(1, Number(options.intervalMinutes || config.postIntervalMinutes));
+  const interval = Math.max(1, Number(options.intervalMinutes || config.publishIntervalMinutes));
   const expression = `every ${interval} minute(s)`;
   const initialDelayMs = Math.max(0, Number(options.initialDelayMs ?? interval * 60 * 1000));
   currentExpression = expression;
