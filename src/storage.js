@@ -22,6 +22,7 @@ const defaultState = {
     activeNumber: 0,
     activeCommentCount: 0,
     repliedComments: {},
+    repliedAuthors: {},
     lastPublishedAt: "",
     lastPublishedPostId: "",
     lastPublishedNumber: 0
@@ -64,6 +65,10 @@ export function readState() {
         repliedComments:
           parsed.market && parsed.market.repliedComments && typeof parsed.market.repliedComments === "object"
             ? parsed.market.repliedComments
+            : {},
+        repliedAuthors:
+          parsed.market && parsed.market.repliedAuthors && typeof parsed.market.repliedAuthors === "object"
+            ? parsed.market.repliedAuthors
             : {}
       },
       bot: {
