@@ -1,52 +1,67 @@
-import cron from "node-cron";
 import { config } from "./config.js";
 
-let currentTask = null;
+let currentTimer = null;
 let isRunning = false;
 let currentExpression = "";
 let currentJob = null;
 let currentTimezone = config.timezone;
+let currentIntervalMs = 0;
+let nextRunAt = "";
+
+function clearCurrentTimer() {
+  if (currentTimer) {
+    clearTimeout(currentTimer);
+    currentTimer = null;
+  }
+}
+
+function scheduleNextRun(delayMs) {
+  if (!currentJob) {
+    return;
+  }
+
+  const safeDelayMs = Math.max(250, Number(delayMs || 0));
+  nextRunAt = new Date(Date.now() + safeDelayMs).toISOString();
+
+  currentTimer = setTimeout(async () => {
+    if (isRunning) {
+      scheduleNextRun(1000);
+      return;
+    }
+
+    isRunning = true;
+
+    try {
+      await currentJob();
+    } finally {
+      isRunning = false;
+      if (currentJob && currentIntervalMs > 0) {
+        scheduleNextRun(currentIntervalMs);
+      }
+    }
+  }, safeDelayMs);
+}
 
 export function startScheduler(job, options = {}) {
   currentJob = job;
   stopScheduler();
 
   const interval = Math.max(1, Number(options.intervalMinutes || config.postIntervalMinutes));
-  const expression = `*/${interval} * * * *`;
+  const expression = `every ${interval} minute(s)`;
+  const initialDelayMs = Math.max(0, Number(options.initialDelayMs ?? interval * 60 * 1000));
   currentExpression = expression;
   currentTimezone = options.timezone || config.timezone;
-
-  currentTask = cron.schedule(
-    expression,
-    async () => {
-      if (isRunning) {
-        return;
-      }
-
-      isRunning = true;
-
-      try {
-        await job();
-      } finally {
-        isRunning = false;
-      }
-    },
-    {
-      timezone: currentTimezone
-    }
-  );
+  currentIntervalMs = interval * 60 * 1000;
+  scheduleNextRun(initialDelayMs);
 
   return expression;
 }
 
 export function stopScheduler() {
-  if (currentTask) {
-    currentTask.stop();
-    currentTask.destroy();
-    currentTask = null;
-  }
-
+  clearCurrentTimer();
   currentExpression = "";
+  currentIntervalMs = 0;
+  nextRunAt = "";
 }
 
 export function restartScheduler(options = {}) {
@@ -58,13 +73,14 @@ export function restartScheduler(options = {}) {
 }
 
 export function schedulerIsActive() {
-  return Boolean(currentTask);
+  return Boolean(currentTimer);
 }
 
 export function getSchedulerSnapshot() {
   return {
     active: schedulerIsActive(),
     expression: currentExpression,
-    timezone: currentTimezone
+    timezone: currentTimezone,
+    nextRunAt
   };
 }

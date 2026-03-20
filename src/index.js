@@ -295,8 +295,33 @@ function getNextRunTimestamp(state = readState()) {
     return "";
   }
 
-  const next = new Date(new Date(reference).getTime() + schedule.intervalMinutes * 60 * 1000);
-  return next.toISOString();
+  const referenceMs = Date.parse(reference);
+  if (!Number.isFinite(referenceMs)) {
+    return "";
+  }
+
+  const intervalMs = schedule.intervalMinutes * 60 * 1000;
+  let nextMs = referenceMs + intervalMs;
+
+  while (nextMs <= Date.now()) {
+    nextMs += intervalMs;
+  }
+
+  return new Date(nextMs).toISOString();
+}
+
+function getMsUntilNextRun(state = readState()) {
+  const nextRunAt = getNextRunTimestamp(state);
+  if (!nextRunAt) {
+    return 0;
+  }
+
+  const nextRunMs = Date.parse(nextRunAt);
+  if (!Number.isFinite(nextRunMs)) {
+    return 0;
+  }
+
+  return Math.max(0, nextRunMs - Date.now());
 }
 
 function buildHeaderHtml(state) {
@@ -313,16 +338,21 @@ function buildHeaderHtml(state) {
         <strong id="nextPostCountdown">--:--:--</strong>
         <span>الوقت المتبقي لنشر المنشور التالي</span>
       </div>
+      <div class="counter-pill">
+        <strong id="deviceClockCounter">--/--/---- 00:00:00</strong>
+        <span>الساعة والتاريخ على جهازك</span>
+      </div>
     </div>
     <script>
       (() => {
         const runtimeNode = document.getElementById("botRuntimeCounter");
         const nextPostNode = document.getElementById("nextPostCountdown");
+        const deviceClockNode = document.getElementById("deviceClockCounter");
         const botActive = ${bot.active ? "true" : "false"};
         const startedAt = ${JSON.stringify(bot.startedAt || "")};
         const nextRunAt = ${JSON.stringify(nextRunAt || "")};
 
-        if (!runtimeNode || !nextPostNode) {
+        if (!runtimeNode || !nextPostNode || !deviceClockNode) {
           return;
         }
 
@@ -334,10 +364,19 @@ function buildHeaderHtml(state) {
           return hours + ":" + minutes + ":" + seconds;
         };
 
+        const formatDeviceTime = (date) =>
+          new Intl.DateTimeFormat("ar-MA", {
+            dateStyle: "short",
+            timeStyle: "medium"
+          }).format(date);
+
         const tick = () => {
-          const now = Date.now();
+          const nowDate = new Date();
+          const now = nowDate.getTime();
           const startedMs = startedAt ? Date.parse(startedAt) : NaN;
           const nextRunMs = nextRunAt ? Date.parse(nextRunAt) : NaN;
+
+          deviceClockNode.textContent = formatDeviceTime(nowDate);
 
           if (botActive && Number.isFinite(startedMs)) {
             runtimeNode.textContent = formatDuration(Math.floor((now - startedMs) / 1000));
@@ -499,7 +538,8 @@ function syncScheduler() {
     }
   }, {
     intervalMinutes: schedule.intervalMinutes,
-    timezone: config.timezone
+    timezone: config.timezone,
+    initialDelayMs: getMsUntilNextRun(state) || schedule.intervalMinutes * 60 * 1000
   });
 
   return getSchedulerSnapshot();
