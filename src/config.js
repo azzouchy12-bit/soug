@@ -69,6 +69,7 @@ export const config = {
   databaseUrl: readEnv("DATABASE_URL"),
   facebookAppId: readEnv("FB_APP_ID"),
   facebookAppSecret: readEnv("FB_APP_SECRET"),
+  facebookGraphApiVersion: readEnv("FB_GRAPH_API_VERSION", "v25.0"),
   facebookPageId: readEnv("FB_PAGE_ID"),
   facebookPageAccessToken: readTokenEnv("FB_PAGE_ACCESS_TOKEN"),
   timezone: readEnv("TIMEZONE", "UTC"),

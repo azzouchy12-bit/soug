@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import { config } from "./config.js";
 
-const graphVersion = "v25.0";
+const graphVersion = config.facebookGraphApiVersion || "v25.0";
 
 function requireAccessToken(token, operation) {
   if (!String(token || "").trim()) {
@@ -11,8 +11,35 @@ function requireAccessToken(token, operation) {
   return String(token).trim();
 }
 
+function requireGraphId(value, label) {
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    throw new Error(`Missing ${label}.`);
+  }
+
+  if (/[/?#\s]/.test(normalized)) {
+    throw new Error(`Invalid ${label}: ${normalized}`);
+  }
+
+  return normalized;
+}
+
+function buildGraphPath(...segments) {
+  const cleaned = segments
+    .map((segment) => String(segment || "").trim())
+    .filter(Boolean)
+    .map((segment) => segment.replace(/^\/+|\/+$/g, ""));
+
+  if (!cleaned.length) {
+    throw new Error("Missing Graph API path.");
+  }
+
+  return `/${cleaned.join("/")}`;
+}
+
 function buildGraphUrl(pathname, params = {}) {
-  const url = new URL(`https://graph.facebook.com/${graphVersion}${pathname}`);
+  const safePath = buildGraphPath(pathname);
+  const url = new URL(`https://graph.facebook.com/${graphVersion}${safePath}`);
 
   for (const [key, value] of Object.entries(params)) {
     if (value !== undefined && value !== null && value !== "") {
@@ -164,8 +191,9 @@ export async function getManagedPages(userAccessToken) {
 }
 
 export async function publishPagePost({ pageId, pageAccessToken, message }) {
+  const safePageId = requireGraphId(pageId, "pageId");
   const accessToken = requireAccessToken(pageAccessToken, "publishPagePost");
-  return graphRequest(`/${pageId}/feed`, {
+  return graphRequest(buildGraphPath(safePageId, "feed"), {
     method: "POST",
     query: {
       access_token: accessToken
@@ -178,8 +206,9 @@ export async function publishPagePost({ pageId, pageAccessToken, message }) {
 }
 
 export async function publishPagePhoto({ pageId, pageAccessToken, caption, imagePath, imageMimeType, imageFilename }) {
+  const safePageId = requireGraphId(pageId, "pageId");
   const accessToken = requireAccessToken(pageAccessToken, "publishPagePhoto");
-  return graphMultipartRequest(`/${pageId}/photos`, {
+  return graphMultipartRequest(buildGraphPath(safePageId, "photos"), {
     fields: {
       access_token: accessToken,
       caption,
@@ -195,8 +224,9 @@ export async function publishPagePhoto({ pageId, pageAccessToken, caption, image
 }
 
 export async function getPageProfile({ pageId, pageAccessToken }) {
+  const safePageId = requireGraphId(pageId, "pageId");
   const accessToken = requireAccessToken(pageAccessToken, "getPageProfile");
-  return graphRequest(`/${pageId}`, {
+  return graphRequest(buildGraphPath(safePageId), {
     query: {
       access_token: accessToken,
       fields: "id,name,fan_count,followers_count,link"
@@ -205,8 +235,9 @@ export async function getPageProfile({ pageId, pageAccessToken }) {
 }
 
 export async function getPostDetails({ postId, pageAccessToken }) {
+  const safePostId = requireGraphId(postId, "postId");
   const accessToken = requireAccessToken(pageAccessToken, "getPostDetails");
-  return graphRequest(`/${postId}`, {
+  return graphRequest(buildGraphPath(safePostId), {
     query: {
       access_token: accessToken,
       fields: "id,message,created_time,permalink_url,comments.summary(true),reactions.summary(true),shares"
@@ -215,8 +246,9 @@ export async function getPostDetails({ postId, pageAccessToken }) {
 }
 
 export async function getPostComments({ postId, pageAccessToken, limit = 10 }) {
+  const safePostId = requireGraphId(postId, "postId");
   const accessToken = requireAccessToken(pageAccessToken, "getPostComments");
-  const response = await graphRequest(`/${postId}/comments`, {
+  const response = await graphRequest(buildGraphPath(safePostId, "comments"), {
     query: {
       access_token: accessToken,
       fields: "id,created_time,message,from{id,name}",
@@ -228,8 +260,9 @@ export async function getPostComments({ postId, pageAccessToken, limit = 10 }) {
 }
 
 export async function likeComment({ commentId, pageAccessToken }) {
+  const safeCommentId = requireGraphId(commentId, "commentId");
   const accessToken = requireAccessToken(pageAccessToken, "likeComment");
-  return graphRequest(`/${commentId}/likes`, {
+  return graphRequest(buildGraphPath(safeCommentId, "likes"), {
     method: "POST",
     query: {
       access_token: accessToken
@@ -241,8 +274,9 @@ export async function likeComment({ commentId, pageAccessToken }) {
 }
 
 export async function replyToComment({ commentId, pageAccessToken, message }) {
+  const safeCommentId = requireGraphId(commentId, "commentId");
   const accessToken = requireAccessToken(pageAccessToken, "replyToComment");
-  return graphRequest(`/${commentId}/comments`, {
+  return graphRequest(buildGraphPath(safeCommentId, "comments"), {
     method: "POST",
     query: {
       access_token: accessToken
