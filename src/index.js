@@ -557,7 +557,20 @@ function isIgnorableLikeError(error) {
   return message.includes("already") || message.includes("liked") || message.includes("duplicate");
 }
 
-async function replyAndLikeComment({ commentId, pageAccessToken, replyText }) {
+async function likeThenReplyComment({ commentId, pageAccessToken, replyText }) {
+  try {
+    await likeComment({
+      commentId,
+      pageAccessToken
+    });
+  } catch (error) {
+    if (!isIgnorableLikeError(error)) {
+      throw error;
+    }
+  }
+
+  await delay(config.commentActionGapMs);
+
   let replyError = null;
 
   for (let attempt = 1; attempt <= 2; attempt += 1) {
@@ -579,19 +592,6 @@ async function replyAndLikeComment({ commentId, pageAccessToken, replyText }) {
 
   if (replyError) {
     throw replyError;
-  }
-
-  await delay(config.commentActionGapMs);
-
-  try {
-    await likeComment({
-      commentId,
-      pageAccessToken
-    });
-  } catch (error) {
-    if (!isIgnorableLikeError(error)) {
-      throw error;
-    }
   }
 }
 
@@ -693,7 +693,7 @@ async function checkLatestPostComments() {
       commentMessage: comment.message || ""
     });
 
-    await replyAndLikeComment({
+    await likeThenReplyComment({
       commentId,
       pageAccessToken: connection.pageAccessToken,
       replyText
