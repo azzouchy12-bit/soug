@@ -71,6 +71,9 @@ async function createFreshSchema(client) {
       reply_message TEXT NOT NULL,
       market_number INT,
       comment_number INT,
+      status TEXT NOT NULL DEFAULT 'queued',
+      retry_count INT NOT NULL DEFAULT 0,
+      scheduled_for TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       last_error TEXT NOT NULL DEFAULT '',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
@@ -98,6 +101,9 @@ async function createFreshSchema(client) {
       author_id TEXT,
       author_name TEXT,
       comment_message TEXT,
+      status TEXT NOT NULL DEFAULT 'queued',
+      retry_count INT NOT NULL DEFAULT 0,
+      scheduled_for TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       last_error TEXT NOT NULL DEFAULT '',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
@@ -126,6 +132,65 @@ async function createFreshSchema(client) {
   );
 }
 
+async function applyNonDestructiveQueueMigrations(client) {
+  await client.query(`
+    ALTER TABLE pending_comment_replies
+    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'queued';
+  `);
+  await client.query(`
+    ALTER TABLE pending_comment_replies
+    ADD COLUMN IF NOT EXISTS retry_count INT NOT NULL DEFAULT 0;
+  `);
+  await client.query(`
+    ALTER TABLE pending_comment_replies
+    ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  `);
+
+  await client.query(`
+    ALTER TABLE pending_comment_likes
+    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'queued';
+  `);
+  await client.query(`
+    ALTER TABLE pending_comment_likes
+    ADD COLUMN IF NOT EXISTS retry_count INT NOT NULL DEFAULT 0;
+  `);
+  await client.query(`
+    ALTER TABLE pending_comment_likes
+    ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  `);
+
+  await client.query(`
+    UPDATE pending_comment_replies
+    SET status = 'queued'
+    WHERE status IS NULL OR status = '' OR status = 'processing';
+  `);
+  await client.query(`
+    UPDATE pending_comment_likes
+    SET status = 'queued'
+    WHERE status IS NULL OR status = '' OR status = 'processing';
+  `);
+  await client.query(`
+    UPDATE pending_comment_replies
+    SET retry_count = 0
+    WHERE retry_count IS NULL;
+  `);
+  await client.query(`
+    UPDATE pending_comment_likes
+    SET retry_count = 0
+    WHERE retry_count IS NULL;
+  `);
+  await client.query(`
+    UPDATE pending_comment_replies
+    SET scheduled_for = COALESCE(scheduled_for, created_at, NOW())
+    WHERE scheduled_for IS NULL;
+  `);
+  await client.query(`
+    UPDATE pending_comment_likes
+    SET scheduled_for = COALESCE(scheduled_for, created_at, NOW())
+    WHERE scheduled_for IS NULL;
+  `);
+}
+
 export async function initDatabase() {
   const db = getPool();
   if (!db) {
@@ -150,6 +215,8 @@ export async function initDatabase() {
     if (currentVersion !== SCHEMA_VERSION) {
       await createFreshSchema(client);
     }
+
+    await applyNonDestructiveQueueMigrations(client);
 
     await client.query("COMMIT");
     return true;
@@ -336,7 +403,8 @@ export async function enqueueCommentReply({
   commentMessage,
   replyMessage,
   marketNumber,
-  commentNumber
+  commentNumber,
+  scheduledFor
 }) {
   const db = getPool();
   if (!db) {
@@ -347,9 +415,9 @@ export async function enqueueCommentReply({
     `
       INSERT INTO pending_comment_replies (
         comment_id, post_id, author_id, author_name, comment_message,
-        reply_message, market_number, comment_number, last_error
+        reply_message, market_number, comment_number, status, retry_count, scheduled_for, last_error
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '')
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued', 0, $9, '')
       ON CONFLICT (comment_id) DO NOTHING
       RETURNING comment_id
     `,
@@ -361,7 +429,8 @@ export async function enqueueCommentReply({
       commentMessage || "",
       replyMessage,
       marketNumber || null,
-      commentNumber || null
+      commentNumber || null,
+      scheduledFor || new Date().toISOString()
     ]
   );
 
@@ -373,7 +442,8 @@ export async function enqueueCommentLike({
   postId,
   authorId,
   authorName,
-  commentMessage
+  commentMessage,
+  scheduledFor
 }) {
   const db = getPool();
   if (!db) {
@@ -383,13 +453,13 @@ export async function enqueueCommentLike({
   const result = await db.query(
     `
       INSERT INTO pending_comment_likes (
-        comment_id, post_id, author_id, author_name, comment_message, last_error
+        comment_id, post_id, author_id, author_name, comment_message, status, retry_count, scheduled_for, last_error
       )
-      VALUES ($1, $2, $3, $4, $5, '')
+      VALUES ($1, $2, $3, $4, $5, 'queued', 0, $6, '')
       ON CONFLICT (comment_id) DO NOTHING
       RETURNING comment_id
     `,
-    [commentId, postId, authorId || null, authorName || null, commentMessage || ""]
+    [commentId, postId, authorId || null, authorName || null, commentMessage || "", scheduledFor || new Date().toISOString()]
   );
 
   return result.rowCount > 0;
@@ -454,6 +524,59 @@ export async function setPendingCommentReplyError(commentId, errorMessage) {
   );
 }
 
+export async function setPendingCommentReplyProcessing(commentId) {
+  const db = getPool();
+  if (!db) {
+    return;
+  }
+
+  await db.query(
+    `
+      UPDATE pending_comment_replies
+      SET status = 'processing', last_error = ''
+      WHERE comment_id = $1
+    `,
+    [commentId]
+  );
+}
+
+export async function setPendingCommentReplyFailed(commentId, errorMessage, scheduledFor) {
+  const db = getPool();
+  if (!db) {
+    return;
+  }
+
+  await db.query(
+    `
+      UPDATE pending_comment_replies
+      SET status = 'failed',
+          retry_count = retry_count + 1,
+          last_error = $2,
+          scheduled_for = $3
+      WHERE comment_id = $1
+    `,
+    [commentId, String(errorMessage || "").slice(0, 1500), scheduledFor || new Date().toISOString()]
+  );
+}
+
+export async function deferPendingCommentReply(commentId, scheduledFor, reason = "") {
+  const db = getPool();
+  if (!db) {
+    return;
+  }
+
+  await db.query(
+    `
+      UPDATE pending_comment_replies
+      SET status = 'queued',
+          last_error = $2,
+          scheduled_for = $3
+      WHERE comment_id = $1
+    `,
+    [commentId, String(reason || "").slice(0, 1500), scheduledFor || new Date().toISOString()]
+  );
+}
+
 export async function markCommentLikeHandled(commentId) {
   const db = getPool();
   if (!db) {
@@ -508,6 +631,122 @@ export async function setPendingCommentLikeError(commentId, errorMessage) {
   );
 }
 
+export async function setPendingCommentLikeProcessing(commentId) {
+  const db = getPool();
+  if (!db) {
+    return;
+  }
+
+  await db.query(
+    `
+      UPDATE pending_comment_likes
+      SET status = 'processing', last_error = ''
+      WHERE comment_id = $1
+    `,
+    [commentId]
+  );
+}
+
+export async function setPendingCommentLikeFailed(commentId, errorMessage, scheduledFor) {
+  const db = getPool();
+  if (!db) {
+    return;
+  }
+
+  await db.query(
+    `
+      UPDATE pending_comment_likes
+      SET status = 'failed',
+          retry_count = retry_count + 1,
+          last_error = $2,
+          scheduled_for = $3
+      WHERE comment_id = $1
+    `,
+    [commentId, String(errorMessage || "").slice(0, 1500), scheduledFor || new Date().toISOString()]
+  );
+}
+
+export async function fetchNextDuePendingCommentReply(nowIso = new Date().toISOString()) {
+  const db = getPool();
+  if (!db) {
+    return null;
+  }
+
+  const result = await db.query(
+    `
+      SELECT
+        comment_id, post_id, author_id, author_name, comment_message,
+        reply_message, market_number, comment_number, status, retry_count, scheduled_for, last_error, created_at
+      FROM pending_comment_replies
+      WHERE status IN ('queued', 'failed') AND scheduled_for <= $1
+      ORDER BY scheduled_for ASC, created_at ASC
+      LIMIT 1
+    `,
+    [nowIso]
+  );
+
+  return result.rows[0] || null;
+}
+
+export async function fetchNextDuePendingCommentLike(nowIso = new Date().toISOString()) {
+  const db = getPool();
+  if (!db) {
+    return null;
+  }
+
+  const result = await db.query(
+    `
+      SELECT
+        comment_id, post_id, author_id, author_name, comment_message, status, retry_count, scheduled_for, last_error, created_at
+      FROM pending_comment_likes
+      WHERE status IN ('queued', 'failed') AND scheduled_for <= $1
+      ORDER BY scheduled_for ASC, created_at ASC
+      LIMIT 1
+    `,
+    [nowIso]
+  );
+
+  return result.rows[0] || null;
+}
+
+export async function hasPendingLikeForComment(commentId) {
+  const db = getPool();
+  if (!db) {
+    return false;
+  }
+
+  const result = await db.query(
+    `
+      SELECT 1
+      FROM pending_comment_likes
+      WHERE comment_id = $1
+      LIMIT 1
+    `,
+    [commentId]
+  );
+
+  return result.rowCount > 0;
+}
+
+export async function isLikeHandledForComment(commentId) {
+  const db = getPool();
+  if (!db) {
+    return false;
+  }
+
+  const result = await db.query(
+    `
+      SELECT 1
+      FROM liked_comments
+      WHERE comment_id = $1
+      LIMIT 1
+    `,
+    [commentId]
+  );
+
+  return result.rowCount > 0;
+}
+
 export async function listPendingCommentReplies(limit = 80) {
   const db = getPool();
   if (!db) {
@@ -519,9 +758,9 @@ export async function listPendingCommentReplies(limit = 80) {
     `
       SELECT
         comment_id, post_id, author_id, author_name, comment_message,
-        reply_message, market_number, comment_number, last_error, created_at
+        reply_message, market_number, comment_number, status, retry_count, scheduled_for, last_error, created_at
       FROM pending_comment_replies
-      ORDER BY created_at DESC
+      ORDER BY scheduled_for ASC, created_at ASC
       LIMIT $1
     `,
     [safeLimit]
@@ -562,9 +801,9 @@ export async function listPendingCommentLikes(limit = 80) {
   const result = await db.query(
     `
       SELECT
-        comment_id, post_id, author_id, author_name, comment_message, last_error, created_at
+        comment_id, post_id, author_id, author_name, comment_message, status, retry_count, scheduled_for, last_error, created_at
       FROM pending_comment_likes
-      ORDER BY created_at DESC
+      ORDER BY scheduled_for ASC, created_at ASC
       LIMIT $1
     `,
     [safeLimit]

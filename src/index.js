@@ -4,10 +4,15 @@ import path from "node:path";
 import express from "express";
 import { config, getMissingCoreConfig } from "./config.js";
 import {
+  deferPendingCommentReply,
   enqueueCommentLike,
   enqueueCommentReply,
   ensureDatabaseSeededFromState,
+  fetchNextDuePendingCommentLike,
+  fetchNextDuePendingCommentReply,
+  hasPendingLikeForComment,
   initDatabase,
+  isLikeHandledForComment,
   isDatabaseConfigured,
   listLikedComments,
   listPendingCommentLikes,
@@ -16,8 +21,10 @@ import {
   loadDatabaseSnapshot,
   markCommentLikeHandled,
   markCommentReplyHandled,
-  setPendingCommentLikeError,
-  setPendingCommentReplyError,
+  setPendingCommentLikeFailed,
+  setPendingCommentLikeProcessing,
+  setPendingCommentReplyFailed,
+  setPendingCommentReplyProcessing,
   moveScheduledPostToPublished,
   upsertScheduledMarketPost
 } from "./database.js";
@@ -191,6 +198,94 @@ function getBotState(state = readState()) {
   return {
     active: state.bot?.active === true,
     startedAt: state.bot?.startedAt || ""
+  };
+}
+
+function parseIsoToMs(value) {
+  const ms = Date.parse(String(value || ""));
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function getCommentActionSettings(state = readState()) {
+  const raw = state.commentActions || {};
+  return {
+    replyDelaySeconds: Math.max(0, Number.parseInt(String(raw.replyDelaySeconds ?? 0), 10) || 0),
+    likeDelaySeconds: Math.max(0, Number.parseInt(String(raw.likeDelaySeconds ?? 0), 10) || 0),
+    nextReplyAllowedAt: String(raw.nextReplyAllowedAt || ""),
+    nextLikeAllowedAt: String(raw.nextLikeAllowedAt || "")
+  };
+}
+
+function getActionTypeMeta(actionType) {
+  if (actionType === "reply") {
+    return {
+      delayKey: "replyDelaySeconds",
+      nextAllowedAtKey: "nextReplyAllowedAt"
+    };
+  }
+
+  return {
+    delayKey: "likeDelaySeconds",
+    nextAllowedAtKey: "nextLikeAllowedAt"
+  };
+}
+
+function previewCommentActionSlot(actionType, state = readState()) {
+  const meta = getActionTypeMeta(actionType);
+  const settings = getCommentActionSettings(state);
+  const delaySeconds = settings[meta.delayKey];
+  const nowMs = Date.now();
+  const nextAllowedMs = parseIsoToMs(settings[meta.nextAllowedAtKey]);
+  const scheduledMs = Math.max(nowMs, nextAllowedMs || nowMs);
+  const scheduledFor = new Date(scheduledMs).toISOString();
+
+  return {
+    scheduledFor,
+    delaySeconds
+  };
+}
+
+function commitCommentActionSlot(actionType, scheduledFor, delaySeconds) {
+  const meta = getActionTypeMeta(actionType);
+  const scheduledMs = parseIsoToMs(scheduledFor) || Date.now();
+  const safeDelaySeconds = Math.max(0, Number.parseInt(String(delaySeconds || 0), 10) || 0);
+
+  updateState((current) => {
+    current.commentActions[meta.nextAllowedAtKey] = new Date(scheduledMs + safeDelaySeconds * 1000).toISOString();
+    return current;
+  });
+}
+
+function setNextAllowedAt(actionType, delaySeconds, fromMs = Date.now()) {
+  const meta = getActionTypeMeta(actionType);
+  const safeDelaySeconds = Math.max(0, Number.parseInt(String(delaySeconds || 0), 10) || 0);
+  const nextAllowedAt = new Date(fromMs + safeDelaySeconds * 1000).toISOString();
+
+  updateState((current) => {
+    current.commentActions[meta.nextAllowedAtKey] = nextAllowedAt;
+    return current;
+  });
+
+  return nextAllowedAt;
+}
+
+function getBlockInfoForAction(actionType, state = readState()) {
+  const settings = getCommentActionSettings(state);
+  const meta = getActionTypeMeta(actionType);
+  const nextAllowedMs = parseIsoToMs(settings[meta.nextAllowedAtKey]);
+  const nowMs = Date.now();
+  if (!nextAllowedMs || nextAllowedMs <= nowMs) {
+    return {
+      blocked: false,
+      nextAllowedAt: "",
+      waitSeconds: 0
+    };
+  }
+
+  return {
+    blocked: true,
+    nextAllowedAt: new Date(nextAllowedMs).toISOString(),
+    waitSeconds: Math.ceil((nextAllowedMs - nowMs) / 1000)
   };
 }
 
@@ -537,59 +632,180 @@ function buildCommentReplyText(marketNumber, commentNumber) {
   return `شكرا ربي يجيب السوق ${marketNumber}.${commentNumber}`;
 }
 
-function delay(ms) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, Math.max(0, Number(ms || 0)));
-  });
-}
-
 function isIgnorableLikeError(error) {
   const message = normalizeErrorMessage(error).toLowerCase();
   return message.includes("already") || message.includes("liked") || message.includes("duplicate");
 }
 
-async function likeThenReplyComment({ commentId, pageAccessToken, replyText }) {
-  let likeSucceeded = false;
+async function processNextLikeQueueItem(connection) {
+  if (!isDatabaseConfigured()) {
+    return false;
+  }
+
+  const blockInfo = getBlockInfoForAction("like");
+  if (blockInfo.blocked) {
+    console.log(
+      `[like] blocked by configured delay. next_allowed_at=${blockInfo.nextAllowedAt} wait_seconds=${blockInfo.waitSeconds}`
+    );
+    return false;
+  }
+
+  const nextLike = await fetchNextDuePendingCommentLike(new Date().toISOString());
+  if (!nextLike) {
+    return false;
+  }
+
+  await setPendingCommentLikeProcessing(nextLike.comment_id);
+  console.log(
+    `[like] processing comment=${nextLike.comment_id} queued_at=${nextLike.created_at || ""} scheduled_for=${nextLike.scheduled_for || ""}`
+  );
+
+  const startedMs = Date.now();
   try {
     await likeComment({
-      commentId,
-      pageAccessToken
+      commentId: nextLike.comment_id,
+      pageAccessToken: connection.pageAccessToken
     });
-    likeSucceeded = true;
+    await markCommentLikeHandled(nextLike.comment_id);
+
+    const likeDelaySeconds = getCommentActionSettings().likeDelaySeconds;
+    const nextAllowedAt = setNextAllowedAt("like", likeDelaySeconds, startedMs);
+    console.log(
+      `[like] executed comment=${nextLike.comment_id} next_allowed_at=${nextAllowedAt} like_delay_seconds=${likeDelaySeconds}`
+    );
+    updateState((current) => {
+      current.scheduler.lastResult = `تم الإعجاب بالتعليق ${nextLike.comment_id}`;
+      current.scheduler.lastError = "";
+      return current;
+    });
   } catch (error) {
+    const message = normalizeErrorMessage(error);
     if (!isIgnorableLikeError(error)) {
-      throw error;
+      const likeDelaySeconds = getCommentActionSettings().likeDelaySeconds;
+      const scheduledFor = new Date(Date.now() + likeDelaySeconds * 1000).toISOString();
+      await setPendingCommentLikeFailed(nextLike.comment_id, message, scheduledFor);
+      setNextAllowedAt("like", likeDelaySeconds);
+      console.error(
+        `[like] failed comment=${nextLike.comment_id} scheduled_for=${scheduledFor} like_delay_seconds=${likeDelaySeconds} error=${message}`
+      );
+      updateState((current) => {
+        current.scheduler.lastError = message;
+        return current;
+      });
+      return true;
     }
-    likeSucceeded = true;
+
+    try {
+      await markCommentLikeHandled(nextLike.comment_id);
+      const likeDelaySeconds = getCommentActionSettings().likeDelaySeconds;
+      const nextAllowedAt = setNextAllowedAt("like", likeDelaySeconds, startedMs);
+      console.log(
+        `[like] executed (ignorable-error) comment=${nextLike.comment_id} next_allowed_at=${nextAllowedAt} like_delay_seconds=${likeDelaySeconds} raw_error=${message}`
+      );
+    } catch (innerError) {
+      const innerMessage = normalizeErrorMessage(innerError);
+      const likeDelaySeconds = getCommentActionSettings().likeDelaySeconds;
+      const scheduledFor = new Date(Date.now() + likeDelaySeconds * 1000).toISOString();
+      await setPendingCommentLikeFailed(nextLike.comment_id, innerMessage, scheduledFor);
+      setNextAllowedAt("like", likeDelaySeconds);
+      console.error(
+        `[like] failed after ignorable-error branch comment=${nextLike.comment_id} scheduled_for=${scheduledFor} error=${innerMessage}`
+      );
+      updateState((current) => {
+        current.scheduler.lastError = innerMessage;
+        return current;
+      });
+    }
   }
 
-  await delay(config.commentActionGapMs);
+  return true;
+}
 
-  let replyError = null;
+async function processNextReplyQueueItem(connection) {
+  if (!isDatabaseConfigured()) {
+    return false;
+  }
 
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    try {
-      await replyToComment({
-        commentId,
-        pageAccessToken,
-        message: replyText
-      });
-      replyError = null;
-      break;
-    } catch (error) {
-      replyError = error;
-      if (attempt < 2) {
-        await delay(4000 * attempt);
+  const blockInfo = getBlockInfoForAction("reply");
+  if (blockInfo.blocked) {
+    console.log(
+      `[reply] blocked by configured delay. next_allowed_at=${blockInfo.nextAllowedAt} wait_seconds=${blockInfo.waitSeconds}`
+    );
+    return false;
+  }
+
+  const nextReply = await fetchNextDuePendingCommentReply(new Date().toISOString());
+  if (!nextReply) {
+    return false;
+  }
+
+  await setPendingCommentReplyProcessing(nextReply.comment_id);
+  console.log(
+    `[reply] processing comment=${nextReply.comment_id} queued_at=${nextReply.created_at || ""} scheduled_for=${nextReply.scheduled_for || ""}`
+  );
+
+  const startedMs = Date.now();
+  try {
+    const likeHandled = await isLikeHandledForComment(nextReply.comment_id);
+    if (!likeHandled) {
+      const pendingLike = await hasPendingLikeForComment(nextReply.comment_id);
+      if (pendingLike) {
+        const replyDelaySeconds = getCommentActionSettings().replyDelaySeconds;
+        const deferredTo = new Date(Date.now() + replyDelaySeconds * 1000).toISOString();
+        await deferPendingCommentReply(nextReply.comment_id, deferredTo, "waiting_like_before_reply");
+        console.log(
+          `[reply] deferred comment=${nextReply.comment_id} reason=waiting_like_before_reply scheduled_for=${deferredTo}`
+        );
+        return true;
       }
     }
+
+    await replyToComment({
+      commentId: nextReply.comment_id,
+      pageAccessToken: connection.pageAccessToken,
+      message: nextReply.reply_message
+    });
+    await markCommentReplyHandled(nextReply.comment_id);
+
+    const authorKey = String(nextReply.author_id || nextReply.author_name || `anon:${nextReply.comment_id}`);
+    updateState((current) => {
+      current.market.repliedComments = {
+        ...(current.market.repliedComments || {}),
+        [nextReply.comment_id]: nextReply.reply_message
+      };
+      current.market.repliedAuthors = {
+        ...(current.market.repliedAuthors || {}),
+        [authorKey]: Number(current.market.repliedAuthors?.[authorKey] || 0) + 1
+      };
+      current.scheduler.lastResult =
+        nextReply.market_number && nextReply.comment_number
+          ? `تم الرد على تعليق جديد في السوق ${nextReply.market_number}.${nextReply.comment_number}`
+          : `تم الرد على التعليق ${nextReply.comment_id}`;
+      current.scheduler.lastError = "";
+      return current;
+    });
+
+    const replyDelaySeconds = getCommentActionSettings().replyDelaySeconds;
+    const nextAllowedAt = setNextAllowedAt("reply", replyDelaySeconds, startedMs);
+    console.log(
+      `[reply] executed comment=${nextReply.comment_id} next_allowed_at=${nextAllowedAt} reply_delay_seconds=${replyDelaySeconds}`
+    );
+  } catch (error) {
+    const message = normalizeErrorMessage(error);
+    const replyDelaySeconds = getCommentActionSettings().replyDelaySeconds;
+    const scheduledFor = new Date(Date.now() + replyDelaySeconds * 1000).toISOString();
+    await setPendingCommentReplyFailed(nextReply.comment_id, message, scheduledFor);
+    setNextAllowedAt("reply", replyDelaySeconds);
+    console.error(
+      `[reply] failed comment=${nextReply.comment_id} scheduled_for=${scheduledFor} reply_delay_seconds=${replyDelaySeconds} error=${message}`
+    );
+    updateState((current) => {
+      current.scheduler.lastError = message;
+      return current;
+    });
   }
 
-  if (replyError) {
-    replyError.likeSucceeded = likeSucceeded;
-    throw replyError;
-  }
-
-  return { likeSucceeded: true, replySucceeded: true };
+  return true;
 }
 
 function extractMarketNumberFromMessage(message) {
@@ -655,7 +871,14 @@ async function checkLatestPostComments() {
     }
 
     const localReplyState = currentMarket.repliedComments?.[commentId];
-    if (localReplyState && localReplyState !== "__processing__") {
+    if (localReplyState === "__processing__") {
+      updateState((current) => {
+        const nextReplies = { ...(current.market.repliedComments || {}) };
+        delete nextReplies[commentId];
+        current.market.repliedComments = nextReplies;
+        return current;
+      });
+    } else if (localReplyState) {
       continue;
     }
 
@@ -663,41 +886,29 @@ async function checkLatestPostComments() {
       continue;
     }
 
-    if (localReplyState === "__processing__") {
-      updateState((current) => {
-        const nextReplies = { ...(current.market.repliedComments || {}) };
-        if (nextReplies[commentId] === "__processing__") {
-          delete nextReplies[commentId];
-          current.market.repliedComments = nextReplies;
-        }
-        return current;
-      });
-    }
-
     if (comment.from?.id && comment.from.id === connection.pageId) {
       continue;
-    }
-
-    const authorKey = String(comment.from?.id || comment.from?.name || `anon:${commentId}`);
-    const hasRepliedToAuthorBefore = Number(currentMarket.repliedAuthors?.[authorKey] || 0) > 0;
-
-    if (hasRepliedToAuthorBefore) {
-      await delay(config.repeatCommentReplyDelayMs);
     }
 
     const nextCommentNumber = Number(currentMarket.activeCommentCount || 0) + 1;
     const replyText = buildCommentReplyText(currentMarket.activeNumber, nextCommentNumber);
     processingCommentIds.add(commentId);
-    updateState((current) => {
-      current.market.repliedComments = {
-        ...(current.market.repliedComments || {}),
-        [commentId]: "__processing__"
-      };
-      return current;
-    });
 
     try {
-      await enqueueCommentReply({
+      const queuedState = readState();
+      const likeSlot = previewCommentActionSlot("like", queuedState);
+      const replySlot = previewCommentActionSlot("reply", queuedState);
+
+      const likeQueued = await enqueueCommentLike({
+        commentId,
+        postId: market.activePostId,
+        authorId: comment.from?.id || "",
+        authorName: comment.from?.name || "",
+        commentMessage: comment.message || "",
+        scheduledFor: likeSlot.scheduledFor
+      });
+
+      const replyQueued = await enqueueCommentReply({
         commentId,
         postId: market.activePostId,
         authorId: comment.from?.id || "",
@@ -705,59 +916,44 @@ async function checkLatestPostComments() {
         commentMessage: comment.message || "",
         replyMessage: replyText,
         marketNumber: currentMarket.activeNumber,
-        commentNumber: nextCommentNumber
+        commentNumber: nextCommentNumber,
+        scheduledFor: replySlot.scheduledFor
       });
 
-      await enqueueCommentLike({
-        commentId,
-        postId: market.activePostId,
-        authorId: comment.from?.id || "",
-        authorName: comment.from?.name || "",
-        commentMessage: comment.message || ""
-      });
-
-      const actionResult = await likeThenReplyComment({
-        commentId,
-        pageAccessToken: connection.pageAccessToken,
-        replyText
-      });
-
-      if (actionResult.likeSucceeded) {
-        await markCommentLikeHandled(commentId);
+      if (likeQueued) {
+        commitCommentActionSlot("like", likeSlot.scheduledFor, likeSlot.delaySeconds);
+        console.log(
+          `[like] queued comment=${commentId} scheduled_for=${likeSlot.scheduledFor} like_delay_seconds=${likeSlot.delaySeconds}`
+        );
       }
-      await markCommentReplyHandled(commentId);
 
-      updateState((current) => {
-        current.market.activeCommentCount = nextCommentNumber;
-        current.market.repliedComments = {
-          ...(current.market.repliedComments || {}),
-          [commentId]: replyText
-        };
-        current.market.repliedAuthors = {
-          ...(current.market.repliedAuthors || {}),
-          [authorKey]: Number(current.market.repliedAuthors?.[authorKey] || 0) + 1
-        };
-        current.scheduler.lastResult = `تم الرد على تعليق جديد في السوق ${current.market.activeNumber}.${nextCommentNumber}`;
-        current.scheduler.lastError = "";
-        return current;
-      });
+      if (replyQueued) {
+        commitCommentActionSlot("reply", replySlot.scheduledFor, replySlot.delaySeconds);
+        console.log(
+          `[reply] queued comment=${commentId} scheduled_for=${replySlot.scheduledFor} reply_delay_seconds=${replySlot.delaySeconds}`
+        );
+      }
+
+      if (replyQueued || likeQueued) {
+        updateState((current) => {
+          if (replyQueued) {
+            current.market.activeCommentCount = Math.max(Number(current.market.activeCommentCount || 0), nextCommentNumber);
+            current.market.repliedComments = {
+              ...(current.market.repliedComments || {}),
+              [commentId]: "__queued__"
+            };
+          }
+          current.scheduler.lastError = "";
+          return current;
+        });
+      }
+
+      if (replyQueued || likeQueued) {
+        return;
+      }
     } catch (error) {
       const errorMessage = normalizeErrorMessage(error);
-      try {
-        if (error.likeSucceeded) {
-          await markCommentLikeHandled(commentId);
-        } else {
-          await setPendingCommentLikeError(commentId, errorMessage);
-        }
-        await setPendingCommentReplyError(commentId, errorMessage);
-      } catch {}
-
       updateState((current) => {
-        if (current.market.repliedComments?.[commentId] === "__processing__") {
-          const nextReplies = { ...(current.market.repliedComments || {}) };
-          delete nextReplies[commentId];
-          current.market.repliedComments = nextReplies;
-        }
         current.scheduler.lastError = errorMessage;
         return current;
       });
@@ -765,8 +961,6 @@ async function checkLatestPostComments() {
     } finally {
       processingCommentIds.delete(commentId);
     }
-
-    return;
   }
 }
 
@@ -780,6 +974,12 @@ function startCommentMonitor() {
     commentMonitorRunning = true;
     try {
       await checkLatestPostComments();
+      const state = readState();
+      const connection = getResolvedPageConnection(state);
+      if (getBotState(state).active && connection.pageAccessToken) {
+        await processNextLikeQueueItem(connection);
+        await processNextReplyQueueItem(connection);
+      }
     } catch (error) {
       const message = normalizeErrorMessage(error);
       updateState((current) => {
@@ -1012,7 +1212,7 @@ async function buildOverviewBody(state) {
           label: "فحص التعليقات",
           value: "كل 15 ثانية",
           note: market.activePostId
-            ? `يتابع الآن السوق رقم ${market.activeNumber} مع تأخير 30 ثانية للتعليقات المتكررة من نفس الشخص`
+            ? `يتابع الآن السوق رقم ${market.activeNumber} مع تأخير قابل للتحكم من الداشبورد للـ Like والرد`
             : "سينتظر أول منشور",
           icon: icons.people
         }
@@ -1228,19 +1428,13 @@ async function buildAudienceBody(state) {
   `;
 }
 
-function buildCommentActionItems(rows, type) {
+function buildCommentActionItems(rows, type, currentDelaySeconds = 0) {
   return rows.map((row) => {
-    const whenText =
-      type === "handled"
-        ? `تم التنفيذ: ${escapeHtml(row.handled_at || row.created_at || "-")}`
-        : `تمت الجدولة: ${escapeHtml(row.created_at || "-")}`;
-
     const commentText = row.comment_message && String(row.comment_message).trim() ? row.comment_message : "[تعليق بدون نص]";
     const details = [
       `المنشور: ${escapeHtml(row.post_id || "-")}`,
       `التعليق: ${escapeHtml(row.comment_id || "-")}`,
-      `الاسم: ${escapeHtml(row.author_name || "غير معروف")}`,
-      whenText
+      `الاسم: ${escapeHtml(row.author_name || "غير معروف")}`
     ];
 
     if (row.market_number) {
@@ -1251,8 +1445,16 @@ function buildCommentActionItems(rows, type) {
       details.push(`رقم التعليق: ${escapeHtml(row.comment_number)}`);
     }
 
-    if (type === "pending" && row.last_error) {
-      details.push(`آخر خطأ: ${escapeHtml(row.last_error)}`);
+    if (type === "handled") {
+      details.push(`وقت الإدراج: ${escapeHtml(row.queued_at || row.created_at || "-")}`);
+      details.push(`وقت التنفيذ: ${escapeHtml(row.handled_at || "-")}`);
+    } else {
+      details.push(`وقت الإدراج: ${escapeHtml(row.created_at || "-")}`);
+      details.push(`وقت التنفيذ المجدول: ${escapeHtml(row.scheduled_for || "-")}`);
+      details.push(`التأخير الحالي (ثانية): ${escapeHtml(currentDelaySeconds)}`);
+      details.push(`الحالة: ${escapeHtml(row.status || "queued")}`);
+      details.push(`عدد المحاولات: ${escapeHtml(row.retry_count ?? 0)}`);
+      details.push(`آخر خطأ: ${escapeHtml(row.last_error || "لا يوجد")}`);
     }
 
     const text =
@@ -1272,7 +1474,7 @@ async function buildRepliedCommentsBody() {
   return `
     <section class="section">
       <h2>${icons.status}<span>التعليقات التي تم الرد عليها</span></h2>
-      ${renderItems(buildCommentActionItems(rows, "handled"), "لا توجد تعليقات تم الرد عليها بعد.")}
+      ${renderItems(buildCommentActionItems(rows, "handled", 0), "لا توجد تعليقات تم الرد عليها بعد.")}
     </section>
   `;
 }
@@ -1282,27 +1484,71 @@ async function buildLikedCommentsBody() {
   return `
     <section class="section">
       <h2>${icons.people}<span>التعليقات التي تم الإعجاب بها</span></h2>
-      ${renderItems(buildCommentActionItems(rows, "handled"), "لا توجد تعليقات تم الإعجاب بها بعد.")}
+      ${renderItems(buildCommentActionItems(rows, "handled", 0), "لا توجد تعليقات تم الإعجاب بها بعد.")}
     </section>
   `;
 }
 
-async function buildQueuedRepliesBody() {
+async function buildQueuedRepliesBody(state) {
+  const commentActions = getCommentActionSettings(state);
   const rows = isDatabaseConfigured() ? await listPendingCommentReplies(80) : [];
   return `
     <section class="section">
+      <h2>${icons.clock}<span>إعداد تأخير الرد</span></h2>
+      <form method="post" action="/dashboard/queued-replies/delay">
+        <div class="stack">
+          ${renderField({
+            label: "reply_delay_seconds (ثواني)",
+            name: "replyDelaySeconds",
+            type: "number",
+            min: "0",
+            max: "86400",
+            value: commentActions.replyDelaySeconds
+          })}
+        </div>
+        <div class="actions">
+          <button class="btn btn-primary" type="submit">حفظ تأخير الرد</button>
+        </div>
+      </form>
+    </section>
+    <section class="section">
       <h2>${icons.edit}<span>التعليقات المجدولة للرد عليها</span></h2>
-      ${renderItems(buildCommentActionItems(rows, "pending"), "لا توجد تعليقات مجدولة للرد حاليًا.")}
+      ${renderItems(
+        buildCommentActionItems(rows, "pending", commentActions.replyDelaySeconds),
+        "لا توجد تعليقات مجدولة للرد حاليًا."
+      )}
     </section>
   `;
 }
 
-async function buildQueuedLikesBody() {
+async function buildQueuedLikesBody(state) {
+  const commentActions = getCommentActionSettings(state);
   const rows = isDatabaseConfigured() ? await listPendingCommentLikes(80) : [];
   return `
     <section class="section">
+      <h2>${icons.clock}<span>إعداد تأخير الإعجاب</span></h2>
+      <form method="post" action="/dashboard/queued-likes/delay">
+        <div class="stack">
+          ${renderField({
+            label: "like_delay_seconds (ثواني)",
+            name: "likeDelaySeconds",
+            type: "number",
+            min: "0",
+            max: "86400",
+            value: commentActions.likeDelaySeconds
+          })}
+        </div>
+        <div class="actions">
+          <button class="btn btn-primary" type="submit">حفظ تأخير الإعجاب</button>
+        </div>
+      </form>
+    </section>
+    <section class="section">
       <h2>${icons.spark}<span>التعليقات المجدولة للإعجاب لها</span></h2>
-      ${renderItems(buildCommentActionItems(rows, "pending"), "لا توجد تعليقات مجدولة للإعجاب حاليًا.")}
+      ${renderItems(
+        buildCommentActionItems(rows, "pending", commentActions.likeDelaySeconds),
+        "لا توجد تعليقات مجدولة للإعجاب حاليًا."
+      )}
     </section>
   `;
 }
@@ -1353,13 +1599,13 @@ async function buildSectionView(sectionKey, state) {
       return {
         pageTitle: "التعليقات المجدولة للرد عليها",
         pageDescription: "التعليقات التي تم وضعها في جدول الرد وتنتظر التنفيذ.",
-        body: await buildQueuedRepliesBody()
+        body: await buildQueuedRepliesBody(state)
       };
     case "queued-likes":
       return {
         pageTitle: "التعليقات المجدولة للإعجاب لها",
         pageDescription: "التعليقات التي تم وضعها في جدول الإعجاب وتنتظر التنفيذ.",
-        body: await buildQueuedLikesBody()
+        body: await buildQueuedLikesBody(state)
       };
     case "audience":
       return {
@@ -1483,6 +1729,44 @@ app.post("/dashboard/timing", ensureDashboardAuth, (req, res) => {
   });
 });
 
+app.post("/dashboard/queued-replies/delay", ensureDashboardAuth, (req, res) => {
+  const replyDelaySeconds = Number.parseInt(String(req.body.replyDelaySeconds || ""), 10);
+  if (!Number.isInteger(replyDelaySeconds) || replyDelaySeconds < 0 || replyDelaySeconds > 86400) {
+    redirectWithMessage(res, "/dashboard/queued-replies", {
+      error: "reply_delay_seconds يجب أن يكون بين 0 و 86400."
+    });
+    return;
+  }
+
+  updateState((current) => {
+    current.commentActions.replyDelaySeconds = replyDelaySeconds;
+    return current;
+  });
+  console.log(`[reply] delay loaded=${replyDelaySeconds}s (updated from dashboard)`);
+  redirectWithMessage(res, "/dashboard/queued-replies", {
+    notice: `تم حفظ reply_delay_seconds = ${replyDelaySeconds}.`
+  });
+});
+
+app.post("/dashboard/queued-likes/delay", ensureDashboardAuth, (req, res) => {
+  const likeDelaySeconds = Number.parseInt(String(req.body.likeDelaySeconds || ""), 10);
+  if (!Number.isInteger(likeDelaySeconds) || likeDelaySeconds < 0 || likeDelaySeconds > 86400) {
+    redirectWithMessage(res, "/dashboard/queued-likes", {
+      error: "like_delay_seconds يجب أن يكون بين 0 و 86400."
+    });
+    return;
+  }
+
+  updateState((current) => {
+    current.commentActions.likeDelaySeconds = likeDelaySeconds;
+    return current;
+  });
+  console.log(`[like] delay loaded=${likeDelaySeconds}s (updated from dashboard)`);
+  redirectWithMessage(res, "/dashboard/queued-likes", {
+    notice: `تم حفظ like_delay_seconds = ${likeDelaySeconds}.`
+  });
+});
+
 app.post("/dashboard/bot-toggle", ensureDashboardAuth, (req, res) => {
   const wantsJson = (req.headers.accept || "").includes("application/json");
   const returnTo = sectionExists(String(req.query.returnTo || "").replace("/dashboard/", ""))
@@ -1590,6 +1874,7 @@ app.get("/status", ensureDashboardAuth, (req, res) => {
   const state = readState();
   const connection = getResolvedPageConnection(state);
   const market = getMarketState(state);
+  const commentActions = getCommentActionSettings(state);
   res.json({
     ok: true,
     baseUrl: config.baseUrl,
@@ -1608,6 +1893,7 @@ app.get("/status", ensureDashboardAuth, (req, res) => {
         }
       : null,
     market,
+    commentActions,
     nextCaption: getNextMarketCaption(state),
     imageUrl: getMarketImageUrl(state),
     missingEnv: getMissingCoreConfig(),
@@ -1704,6 +1990,9 @@ app.listen(config.port, async () => {
   }
 
   syncScheduler();
+  const commentActions = getCommentActionSettings(readState());
+  console.log(`[reply] delay loaded=${commentActions.replyDelaySeconds}s`);
+  console.log(`[like] delay loaded=${commentActions.likeDelaySeconds}s`);
 
   if (hasDirectPageAccessToken()) {
     await refreshDirectPageProfile();

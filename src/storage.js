@@ -26,6 +26,12 @@ const defaultState = {
     active: false,
     startedAt: ""
   },
+  commentActions: {
+    replyDelaySeconds: 0,
+    likeDelaySeconds: 0,
+    nextReplyAllowedAt: "",
+    nextLikeAllowedAt: ""
+  },
   scheduler: {
     enabled: true,
     intervalMinutes: config.publishIntervalMinutes,
@@ -67,6 +73,26 @@ export function readState() {
       bot: {
         ...structuredClone(defaultState.bot),
         ...(parsed.bot || {})
+      },
+      commentActions: {
+        ...structuredClone(defaultState.commentActions),
+        ...(parsed.commentActions || {}),
+        replyDelaySeconds: Math.max(
+          0,
+          Number.parseInt(
+            String(parsed.commentActions?.replyDelaySeconds ?? defaultState.commentActions.replyDelaySeconds),
+            10
+          ) || 0
+        ),
+        likeDelaySeconds: Math.max(
+          0,
+          Number.parseInt(
+            String(parsed.commentActions?.likeDelaySeconds ?? defaultState.commentActions.likeDelaySeconds),
+            10
+          ) || 0
+        ),
+        nextReplyAllowedAt: String(parsed.commentActions?.nextReplyAllowedAt || ""),
+        nextLikeAllowedAt: String(parsed.commentActions?.nextLikeAllowedAt || "")
       },
       scheduler: {
         ...structuredClone(defaultState.scheduler),
