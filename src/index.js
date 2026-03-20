@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import express from "express";
-import { generatePostsWithOpenAI } from "./ai.js";
+import { generatePostsWithDeepSeek } from "./ai.js";
 import { config, getMissingCoreConfig } from "./config.js";
 import {
   deleteScheduledPost,
@@ -616,7 +616,7 @@ function renderQueuedPostsEditor(state) {
 
   return `
     <section class="section">
-      <h2>${icons.spark}<span>توليد منشورات بالذكاء الاصطناعي عبر OpenAI</span></h2>
+      <h2>${icons.spark}<span>توليد منشورات بالذكاء الاصطناعي عبر DeepSeek</span></h2>
       <form id="aiPostsForm" method="post" action="/dashboard/content/ai">
         ${renderField({
           label: "اكتب موضوع الصفحة أو نوع المنشورات التي تريدها. مثال: نصائح تعليمية قصيرة لطلبة الفيزياء والكيمياء.",
@@ -1308,7 +1308,7 @@ app.post("/dashboard/content/ai", ensureDashboardAuth, async (req, res) => {
       ...getQueuedPosts(state).map((post) => post.text),
       ...state.posts.slice(-8).map((post) => post.message)
     ];
-    const generatedPosts = await generatePostsWithOpenAI({
+    const generatedPosts = await generatePostsWithDeepSeek({
       prompt: aiPrompt,
       count: aiCount,
       existingPosts
