@@ -215,7 +215,7 @@ export async function getPostComments({ postId, pageAccessToken, limit = 10 }) {
 export async function likeComment({ commentId, pageAccessToken }) {
   return graphRequest(`/${commentId}/likes`, {
     method: "POST",
-    body: {
+    query: {
       access_token: pageAccessToken
     }
   });
@@ -224,8 +224,10 @@ export async function likeComment({ commentId, pageAccessToken }) {
 export async function replyToComment({ commentId, pageAccessToken, message }) {
   return graphRequest(`/${commentId}/comments`, {
     method: "POST",
+    query: {
+      access_token: pageAccessToken
+    },
     body: {
-      access_token: pageAccessToken,
       message
     }
   });

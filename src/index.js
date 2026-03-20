@@ -499,6 +499,47 @@ function delay(ms) {
   });
 }
 
+function isIgnorableLikeError(error) {
+  const message = normalizeErrorMessage(error).toLowerCase();
+  return message.includes("already") || message.includes("liked") || message.includes("duplicate");
+}
+
+async function replyAndLikeComment({ commentId, pageAccessToken, replyText }) {
+  let replyError = null;
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      await replyToComment({
+        commentId,
+        pageAccessToken,
+        message: replyText
+      });
+      replyError = null;
+      break;
+    } catch (error) {
+      replyError = error;
+      if (attempt < 3) {
+        await delay(2000 * attempt);
+      }
+    }
+  }
+
+  if (replyError) {
+    throw replyError;
+  }
+
+  try {
+    await likeComment({
+      commentId,
+      pageAccessToken
+    });
+  } catch (error) {
+    if (!isIgnorableLikeError(error)) {
+      throw error;
+    }
+  }
+}
+
 function extractMarketNumberFromMessage(message) {
   const match = String(message || "").match(/السوق رقم\s+(\d+)/);
   return match ? Number.parseInt(match[1], 10) : 0;
@@ -563,15 +604,10 @@ async function checkLatestPostComments() {
     const nextCommentNumber = Number(currentMarket.activeCommentCount || 0) + 1;
     const replyText = buildCommentReplyText(currentMarket.activeNumber, nextCommentNumber);
 
-    await likeComment({
-      commentId,
-      pageAccessToken: connection.pageAccessToken
-    });
-
-    await replyToComment({
+    await replyAndLikeComment({
       commentId,
       pageAccessToken: connection.pageAccessToken,
-      message: replyText
+      replyText
     });
 
     updateState((current) => {
