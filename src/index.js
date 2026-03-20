@@ -515,10 +515,23 @@ function isIgnorableLikeError(error) {
   return message.includes("already") || message.includes("liked") || message.includes("duplicate");
 }
 
+function isRateLimitError(error) {
+  const message = normalizeErrorMessage(error).toLowerCase();
+  return (
+    message.includes("rate limit") ||
+    message.includes("rate-limit") ||
+    message.includes("too many") ||
+    message.includes("temporarily blocked") ||
+    message.includes("try again later") ||
+    message.includes("نقيّد معدل") ||
+    message.includes("يمكنك إعادة المحاولة لاحقًا")
+  );
+}
+
 async function replyAndLikeComment({ commentId, pageAccessToken, replyText }) {
   let replyError = null;
 
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
       await replyToComment({
         commentId,
@@ -529,8 +542,12 @@ async function replyAndLikeComment({ commentId, pageAccessToken, replyText }) {
       break;
     } catch (error) {
       replyError = error;
-      if (attempt < 3) {
-        await delay(2000 * attempt);
+      if (isRateLimitError(error)) {
+        throw error;
+      }
+
+      if (attempt < 2) {
+        await delay(4000 * attempt);
       }
     }
   }
@@ -538,6 +555,8 @@ async function replyAndLikeComment({ commentId, pageAccessToken, replyText }) {
   if (replyError) {
     throw replyError;
   }
+
+  await delay(config.commentActionGapMs);
 
   try {
     await likeComment({
@@ -587,6 +606,11 @@ async function checkLatestPostComments() {
   }
 
   if (!bot.active || !market.activePostId || !connection.pageAccessToken) {
+    return;
+  }
+
+  const pausedUntilMs = Date.parse(market.commentMonitorPausedUntil || "");
+  if (Number.isFinite(pausedUntilMs) && pausedUntilMs > Date.now()) {
     return;
   }
 
@@ -650,6 +674,8 @@ async function checkLatestPostComments() {
       current.scheduler.lastError = "";
       return current;
     });
+
+    return;
   }
 }
 
@@ -671,11 +697,17 @@ function startCommentMonitor() {
     try {
       await checkLatestPostComments();
     } catch (error) {
+      const message = normalizeErrorMessage(error);
       updateState((current) => {
-        current.scheduler.lastError = normalizeErrorMessage(error);
+        current.scheduler.lastError = message;
+        if (isRateLimitError(error)) {
+          current.market.commentMonitorPausedUntil = new Date(
+            Date.now() + config.commentRateLimitCooldownMs
+          ).toISOString();
+        }
         return current;
       });
-      console.error("[comments] failed:", normalizeErrorMessage(error));
+      console.error("[comments] failed:", message);
     } finally {
       commentMonitorRunning = false;
     }
@@ -746,6 +778,7 @@ async function runPostingJob() {
     current.market.activeCommentCount = 0;
     current.market.repliedComments = {};
     current.market.repliedAuthors = {};
+    current.market.commentMonitorPausedUntil = "";
     current.market.nextNumber = marketNumber + 1;
     current.scheduler.lastRunAt = new Date().toISOString();
     current.scheduler.lastResult = `تم نشر ${caption} بنجاح`;
@@ -823,7 +856,7 @@ function renderQueuedPostsEditor(state) {
         { label: "الصورة الحالية", value: hasImage ? "مرفوعة" : "غير مرفوعة", icon: icons.page },
         { label: "المنشور القادم", value: `السوق رقم ${market.nextNumber || 1}`, icon: icons.spark },
         { label: "آخر منشور", value: market.lastPublishedNumber ? `السوق رقم ${market.lastPublishedNumber}` : "لم ينشر بعد", icon: icons.posts },
-        { label: "فحص التعليقات", value: "كل ثانية تقريبًا", icon: icons.clock }
+        { label: "فحص التعليقات", value: "كل 15 ثانية", icon: icons.clock }
       ])}
       ${hasImage
         ? `<div class="stack">
@@ -838,7 +871,7 @@ function renderQueuedPostsEditor(state) {
     <section class="section">
       <h2>${icons.spark}<span>الردود التلقائية</span></h2>
       <div class="empty">
-        يراقب البوت آخر منشور نشره فقط بشكل شبه لحظي، ويضع إعجابًا لكل تعليق جديد ثم يرد بصيغة:
+        يراقب البوت آخر منشور نشره فقط كل 15 ثانية، ويعالج تعليقًا واحدًا في كل دورة لتفادي تقييد فيسبوك.
         <br />
         شكرا ربي يجيب السوق X.Y
       </div>
@@ -894,8 +927,10 @@ async function buildOverviewBody(state) {
         },
         {
           label: "فحص التعليقات",
-          value: "كل ثانية تقريبًا",
-          note: market.activePostId ? `يتابع الآن السوق رقم ${market.activeNumber} مع تأخير 10 ثوانٍ للتعليقات المتكررة من نفس الشخص` : "سينتظر أول منشور",
+          value: "كل 15 ثانية",
+          note: market.activePostId
+            ? `يتابع الآن السوق رقم ${market.activeNumber} مع تأخير 30 ثانية للتعليقات المتكررة من نفس الشخص`
+            : "سينتظر أول منشور",
           icon: icons.people
         }
       ])}
@@ -919,7 +954,7 @@ function buildTimingBody(state) {
     <section class="section">
       <h2>${icons.clock}<span>توقيت البوت</span></h2>
       <div class="empty">
-        النشر مضبوط حاليًا على صورة واحدة كل 8 ساعات، مع فحص تعليقات آخر منشور كل ثانية تقريبًا.
+        النشر مضبوط حاليًا على صورة واحدة كل 8 ساعات، مع فحص تعليقات آخر منشور كل 15 ثانية.
       </div>
     </section>
     <section class="section">
@@ -927,7 +962,7 @@ function buildTimingBody(state) {
       ${renderMetrics([
         { label: "الحالة الحالية", value: schedule.enabled ? "مفعلة" : "متوقفة", level: schedule.enabled ? "good" : "warn", icon: icons.status },
         { label: "فاصل النشر", value: `${Math.round(schedule.intervalMinutes / 60)} ساعات`, icon: icons.clock },
-        { label: "فحص التعليقات", value: "كل ثانية تقريبًا", icon: icons.people },
+        { label: "فحص التعليقات", value: "كل 15 ثانية", icon: icons.people },
         { label: "آخر تشغيل", value: state.scheduler.lastRunAt || "لم يتم بعد", icon: icons.status },
         { label: "الموعد القادم", value: computeNextRunText(state), icon: icons.spark }
       ])}
@@ -1107,7 +1142,7 @@ async function buildSectionView(sectionKey, state) {
     case "timing":
       return {
         pageTitle: "التحكم في الوقت",
-        pageDescription: "هذا الإصدار ينشر صورة السوق كل 8 ساعات، ويفحص تعليقات آخر منشور بشكل شبه لحظي.",
+        pageDescription: "هذا الإصدار ينشر صورة السوق كل 8 ساعات، ويفحص تعليقات آخر منشور بطريقة أهدأ وآمنة أكثر.",
         body: buildTimingBody(state)
       };
     case "next-post":
@@ -1222,7 +1257,7 @@ app.get("/dashboard/:section", ensureDashboardAuth, async (req, res) => {
 
 app.post("/dashboard/timing", ensureDashboardAuth, (req, res) => {
   redirectWithMessage(res, "/dashboard/timing", {
-    notice: "توقيت هذا الإصدار ثابت: نشر كل 8 ساعات وفحص التعليقات بشكل شبه لحظي."
+    notice: "توقيت هذا الإصدار ثابت: نشر كل 8 ساعات وفحص التعليقات كل 15 ثانية."
   });
 });
 
