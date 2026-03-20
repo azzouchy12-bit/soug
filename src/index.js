@@ -111,7 +111,26 @@ function clearDashboardSession(res) {
 }
 
 function redirectWithMessage(res, pathname, params = {}) {
-  const target = new URL(pathname, config.baseUrl);
+  const rawPath = String(pathname || "").trim();
+  let safePath = rawPath || "/dashboard/overview";
+
+  if (safePath.startsWith("http://") || safePath.startsWith("https://")) {
+    try {
+      const parsed = new URL(safePath);
+      safePath = `${parsed.pathname}${parsed.search}`;
+    } catch {
+      safePath = "/dashboard/overview";
+    }
+  } else if (!safePath.startsWith("/")) {
+    safePath = `/${safePath.replace(/^\/+/, "")}`;
+  }
+
+  let target;
+  try {
+    target = new URL(safePath, config.baseUrl || "http://localhost:3000");
+  } catch {
+    target = new URL(safePath, "http://localhost:3000");
+  }
 
   for (const [key, value] of Object.entries(params)) {
     if (value) {
@@ -346,13 +365,55 @@ function buildTopActions(sectionKey, state) {
   const returnTo = `/dashboard/${sectionKey}`;
 
   return `
-    <form method="post" action="/dashboard/bot-toggle?returnTo=${encodeURIComponent(returnTo)}">
+    <form id="botToggleForm" method="post" action="/dashboard/bot-toggle?returnTo=${encodeURIComponent(returnTo)}">
       <button class="btn btn-ghost" type="submit">
         ${icons.run}
         <span>${bot.active ? "إغلاق البوت" : "تشغيل البوت"}</span>
       </button>
     </form>
     <a class="btn btn-ghost" href="/status">${icons.status}<span>JSON</span></a>
+    <script>
+      (() => {
+        const form = document.getElementById("botToggleForm");
+        if (!form) {
+          return;
+        }
+
+        form.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          const button = form.querySelector("button");
+          if (button) {
+            button.disabled = true;
+          }
+
+          try {
+            const response = await fetch(form.action, {
+              method: "POST",
+              headers: {
+                Accept: "application/json"
+              }
+            });
+
+            const payload = await response.json();
+
+            if (!response.ok || !payload.ok) {
+              window.alert(payload.error || "تعذر تحديث حالة البوت.");
+              if (button) {
+                button.disabled = false;
+              }
+              return;
+            }
+
+            window.location.reload();
+          } catch (error) {
+            window.alert("تعذر الاتصال بالخادم. حاول مرة أخرى.");
+            if (button) {
+              button.disabled = false;
+            }
+          }
+        });
+      })();
+    </script>
   `;
 }
 
@@ -960,22 +1021,44 @@ app.post("/dashboard/timing", ensureDashboardAuth, (req, res) => {
 });
 
 app.post("/dashboard/bot-toggle", ensureDashboardAuth, (req, res) => {
+  const wantsJson = (req.headers.accept || "").includes("application/json");
   const returnTo = sectionExists(String(req.query.returnTo || "").replace("/dashboard/", ""))
     ? String(req.query.returnTo || "/dashboard/overview")
     : "/dashboard/overview";
 
-  const nextState = updateState((current) => {
-    const isActive = current.bot?.active === true;
-    current.bot.active = !isActive;
-    current.bot.startedAt = !isActive ? new Date().toISOString() : "";
-    current.scheduler.lastError = "";
-    return current;
-  });
+  try {
+    const nextState = updateState((current) => {
+      const isActive = current.bot?.active === true;
+      current.bot.active = !isActive;
+      current.bot.startedAt = !isActive ? new Date().toISOString() : "";
+      current.scheduler.lastError = "";
+      return current;
+    });
 
-  syncScheduler();
-  redirectWithMessage(res, returnTo, {
-    notice: nextState.bot.active ? "تم تشغيل البوت في الخلفية." : "تم إغلاق البوت."
-  });
+    syncScheduler();
+
+    if (wantsJson) {
+      res.json({
+        ok: true,
+        active: nextState.bot.active,
+        notice: nextState.bot.active ? "تم تشغيل البوت في الخلفية." : "تم إغلاق البوت."
+      });
+      return;
+    }
+
+    redirectWithMessage(res, returnTo, {
+      notice: nextState.bot.active ? "تم تشغيل البوت في الخلفية." : "تم إغلاق البوت."
+    });
+  } catch (error) {
+    const message = normalizeErrorMessage(error);
+
+    if (wantsJson) {
+      res.status(500).json({ ok: false, error: message });
+      return;
+    }
+
+    redirectWithMessage(res, returnTo, { error: message });
+  }
 });
 
 app.post("/dashboard/content", ensureDashboardAuth, (req, res) => {
