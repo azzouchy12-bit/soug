@@ -9,6 +9,8 @@ import {
   ensureDatabaseSeededFromState,
   initDatabase,
   isDatabaseConfigured,
+  listCommentLikes,
+  listCommentReplies,
   loadDatabaseSnapshot,
   markCommentLikeHandled,
   markCommentReplyHandled,
@@ -1183,6 +1185,81 @@ async function buildAudienceBody(state) {
   `;
 }
 
+function buildCommentActionItems(rows, type) {
+  return rows.map((row) => {
+    const whenText =
+      type === "handled"
+        ? `تم التنفيذ: ${escapeHtml(row.handled_at || row.created_at || "-")}`
+        : `تمت الجدولة: ${escapeHtml(row.created_at || "-")}`;
+
+    const commentText = row.comment_message && String(row.comment_message).trim() ? row.comment_message : "[تعليق بدون نص]";
+    const details = [
+      `المنشور: ${escapeHtml(row.post_id || "-")}`,
+      `التعليق: ${escapeHtml(row.comment_id || "-")}`,
+      `الاسم: ${escapeHtml(row.author_name || "غير معروف")}`,
+      whenText
+    ];
+
+    if (row.market_number) {
+      details.push(`السوق: ${escapeHtml(row.market_number)}`);
+    }
+
+    if (row.comment_number) {
+      details.push(`رقم التعليق: ${escapeHtml(row.comment_number)}`);
+    }
+
+    const text =
+      row.reply_message
+        ? `التعليق:\n${commentText}\n\nالرد:\n${row.reply_message}`
+        : `التعليق:\n${commentText}`;
+
+    return {
+      meta: details.join(" | "),
+      text
+    };
+  });
+}
+
+async function buildRepliedCommentsBody() {
+  const rows = isDatabaseConfigured() ? await listCommentReplies({ status: "handled", limit: 80 }) : [];
+  return `
+    <section class="section">
+      <h2>${icons.status}<span>التعليقات التي تم الرد عليها</span></h2>
+      ${renderItems(buildCommentActionItems(rows, "handled"), "لا توجد تعليقات تم الرد عليها بعد.")}
+    </section>
+  `;
+}
+
+async function buildLikedCommentsBody() {
+  const rows = isDatabaseConfigured() ? await listCommentLikes({ status: "handled", limit: 80 }) : [];
+  return `
+    <section class="section">
+      <h2>${icons.people}<span>التعليقات التي تم الإعجاب بها</span></h2>
+      ${renderItems(buildCommentActionItems(rows, "handled"), "لا توجد تعليقات تم الإعجاب بها بعد.")}
+    </section>
+  `;
+}
+
+async function buildQueuedRepliesBody() {
+  const rows = isDatabaseConfigured() ? await listCommentReplies({ status: "pending", limit: 80 }) : [];
+  return `
+    <section class="section">
+      <h2>${icons.edit}<span>التعليقات المجدولة للرد عليها</span></h2>
+      ${renderItems(buildCommentActionItems(rows, "pending"), "لا توجد تعليقات مجدولة للرد حاليًا.")}
+    </section>
+  `;
+}
+
+async function buildQueuedLikesBody() {
+  const rows = isDatabaseConfigured() ? await listCommentLikes({ status: "pending", limit: 80 }) : [];
+  return `
+    <section class="section">
+      <h2>${icons.spark}<span>التعليقات المجدولة للإعجاب لها</span></h2>
+      ${renderItems(buildCommentActionItems(rows, "pending"), "لا توجد تعليقات مجدولة للإعجاب حاليًا.")}
+    </section>
+  `;
+}
+
 function buildContentBody(state) {
   return renderQueuedPostsEditor(state);
 }
@@ -1212,6 +1289,30 @@ async function buildSectionView(sectionKey, state) {
         pageTitle: "المنشورات التي تمت نشرها",
         pageDescription: "مراجعة آخر المنشورات التي نشرها البوت.",
         body: await buildPostsBody(state)
+      };
+    case "replied-comments":
+      return {
+        pageTitle: "التعليقات التي تم الرد عليها",
+        pageDescription: "سجل التعليقات التي رد عليها البوت فعليًا من Postgres.",
+        body: await buildRepliedCommentsBody()
+      };
+    case "liked-comments":
+      return {
+        pageTitle: "التعليقات التي تم الإعجاب بها",
+        pageDescription: "سجل التعليقات التي عمل لها البوت إعجابًا فعليًا من Postgres.",
+        body: await buildLikedCommentsBody()
+      };
+    case "queued-replies":
+      return {
+        pageTitle: "التعليقات المجدولة للرد عليها",
+        pageDescription: "التعليقات التي تم وضعها في جدول الرد وتنتظر التنفيذ.",
+        body: await buildQueuedRepliesBody()
+      };
+    case "queued-likes":
+      return {
+        pageTitle: "التعليقات المجدولة للإعجاب لها",
+        pageDescription: "التعليقات التي تم وضعها في جدول الإعجاب وتنتظر التنفيذ.",
+        body: await buildQueuedLikesBody()
       };
     case "audience":
       return {

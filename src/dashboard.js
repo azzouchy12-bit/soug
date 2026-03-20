@@ -457,6 +457,10 @@ const sections = [
   { key: "timing", label: "التحكم في الوقت", icon: icons.clock },
   { key: "next-post", label: "المنشور التالي", icon: icons.spark },
   { key: "posts", label: "المنشورات التي تمت نشرها", icon: icons.posts },
+  { key: "replied-comments", label: "التعليقات التي تم الرد عليها", icon: icons.status },
+  { key: "liked-comments", label: "التعليقات التي تم الإعجاب بها", icon: icons.people },
+  { key: "queued-replies", label: "التعليقات المجدولة للرد", icon: icons.edit },
+  { key: "queued-likes", label: "التعليقات المجدولة للإعجاب", icon: icons.spark },
   { key: "audience", label: "الأشخاص المتفاعلون", icon: icons.people },
   { key: "content", label: "إدارة المنشورات", icon: icons.edit }
 ];

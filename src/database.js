@@ -389,3 +389,80 @@ export async function markCommentLikeHandled(commentId) {
     [commentId]
   );
 }
+
+export async function listCommentReplies({ status, limit = 50 } = {}) {
+  const db = getPool();
+  if (!db) {
+    return [];
+  }
+
+  const values = [];
+  let where = "";
+  if (status) {
+    values.push(status);
+    where = `WHERE status = $${values.length}`;
+  }
+
+  values.push(Math.max(1, Number(limit || 50)));
+
+  const result = await db.query(
+    `
+      SELECT
+        comment_id,
+        post_id,
+        author_id,
+        author_name,
+        comment_message,
+        reply_message,
+        market_number,
+        comment_number,
+        status,
+        created_at,
+        handled_at
+      FROM comment_reply_queue
+      ${where}
+      ORDER BY COALESCE(handled_at, created_at) DESC, created_at DESC
+      LIMIT $${values.length}
+    `,
+    values
+  );
+
+  return result.rows;
+}
+
+export async function listCommentLikes({ status, limit = 50 } = {}) {
+  const db = getPool();
+  if (!db) {
+    return [];
+  }
+
+  const values = [];
+  let where = "";
+  if (status) {
+    values.push(status);
+    where = `WHERE status = $${values.length}`;
+  }
+
+  values.push(Math.max(1, Number(limit || 50)));
+
+  const result = await db.query(
+    `
+      SELECT
+        comment_id,
+        post_id,
+        author_id,
+        author_name,
+        comment_message,
+        status,
+        created_at,
+        handled_at
+      FROM comment_like_queue
+      ${where}
+      ORDER BY COALESCE(handled_at, created_at) DESC, created_at DESC
+      LIMIT $${values.length}
+    `,
+    values
+  );
+
+  return result.rows;
+}
