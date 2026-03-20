@@ -46,6 +46,7 @@ const app = express();
 const DASHBOARD_COOKIE = "dashboard_session";
 let commentMonitorTimer = null;
 let commentMonitorRunning = false;
+const processingCommentIds = new Set();
 const upload = multer({ dest: config.uploadsDir });
 
 app.use(express.json());
@@ -607,6 +608,7 @@ function stopCommentMonitor() {
   }
 
   commentMonitorRunning = false;
+  processingCommentIds.clear();
 }
 
 async function checkLatestPostComments() {
@@ -656,7 +658,7 @@ async function checkLatestPostComments() {
       return;
     }
 
-    if (currentMarket.repliedComments?.[commentId]) {
+    if (currentMarket.repliedComments?.[commentId] || processingCommentIds.has(commentId)) {
       continue;
     }
 
@@ -673,49 +675,72 @@ async function checkLatestPostComments() {
 
     const nextCommentNumber = Number(currentMarket.activeCommentCount || 0) + 1;
     const replyText = buildCommentReplyText(currentMarket.activeNumber, nextCommentNumber);
-
-    await enqueueCommentReply({
-      commentId,
-      postId: market.activePostId,
-      authorId: comment.from?.id || "",
-      authorName: comment.from?.name || "",
-      commentMessage: comment.message || "",
-      replyMessage: replyText,
-      marketNumber: currentMarket.activeNumber,
-      commentNumber: nextCommentNumber
-    });
-
-    await enqueueCommentLike({
-      commentId,
-      postId: market.activePostId,
-      authorId: comment.from?.id || "",
-      authorName: comment.from?.name || "",
-      commentMessage: comment.message || ""
-    });
-
-    await likeThenReplyComment({
-      commentId,
-      pageAccessToken: connection.pageAccessToken,
-      replyText
-    });
-
-    await markCommentReplyHandled(commentId);
-    await markCommentLikeHandled(commentId);
-
+    processingCommentIds.add(commentId);
     updateState((current) => {
-      current.market.activeCommentCount = nextCommentNumber;
       current.market.repliedComments = {
         ...(current.market.repliedComments || {}),
-        [commentId]: replyText
+        [commentId]: "__processing__"
       };
-      current.market.repliedAuthors = {
-        ...(current.market.repliedAuthors || {}),
-        [authorKey]: Number(current.market.repliedAuthors?.[authorKey] || 0) + 1
-      };
-      current.scheduler.lastResult = `تم الرد على تعليق جديد في السوق ${current.market.activeNumber}.${nextCommentNumber}`;
-      current.scheduler.lastError = "";
       return current;
     });
+
+    try {
+      await enqueueCommentReply({
+        commentId,
+        postId: market.activePostId,
+        authorId: comment.from?.id || "",
+        authorName: comment.from?.name || "",
+        commentMessage: comment.message || "",
+        replyMessage: replyText,
+        marketNumber: currentMarket.activeNumber,
+        commentNumber: nextCommentNumber
+      });
+
+      await enqueueCommentLike({
+        commentId,
+        postId: market.activePostId,
+        authorId: comment.from?.id || "",
+        authorName: comment.from?.name || "",
+        commentMessage: comment.message || ""
+      });
+
+      await likeThenReplyComment({
+        commentId,
+        pageAccessToken: connection.pageAccessToken,
+        replyText
+      });
+
+      await markCommentReplyHandled(commentId);
+      await markCommentLikeHandled(commentId);
+
+      updateState((current) => {
+        current.market.activeCommentCount = nextCommentNumber;
+        current.market.repliedComments = {
+          ...(current.market.repliedComments || {}),
+          [commentId]: replyText
+        };
+        current.market.repliedAuthors = {
+          ...(current.market.repliedAuthors || {}),
+          [authorKey]: Number(current.market.repliedAuthors?.[authorKey] || 0) + 1
+        };
+        current.scheduler.lastResult = `تم الرد على تعليق جديد في السوق ${current.market.activeNumber}.${nextCommentNumber}`;
+        current.scheduler.lastError = "";
+        return current;
+      });
+    } catch (error) {
+      updateState((current) => {
+        if (current.market.repliedComments?.[commentId] === "__processing__") {
+          const nextReplies = { ...(current.market.repliedComments || {}) };
+          delete nextReplies[commentId];
+          current.market.repliedComments = nextReplies;
+        }
+        current.scheduler.lastError = normalizeErrorMessage(error);
+        return current;
+      });
+      throw error;
+    } finally {
+      processingCommentIds.delete(commentId);
+    }
 
     return;
   }
@@ -723,14 +748,7 @@ async function checkLatestPostComments() {
 
 function startCommentMonitor() {
   stopCommentMonitor();
-  void checkLatestPostComments().catch((error) => {
-    updateState((current) => {
-      current.scheduler.lastError = normalizeErrorMessage(error);
-      return current;
-    });
-    console.error("[comments] failed:", normalizeErrorMessage(error));
-  });
-  commentMonitorTimer = setInterval(async () => {
+  const runCommentMonitorCycle = async () => {
     if (commentMonitorRunning) {
       return;
     }
@@ -748,7 +766,10 @@ function startCommentMonitor() {
     } finally {
       commentMonitorRunning = false;
     }
-  }, config.commentCheckIntervalMs);
+  };
+
+  void runCommentMonitorCycle();
+  commentMonitorTimer = setInterval(runCommentMonitorCycle, config.commentCheckIntervalMs);
 }
 
 async function runPostingJob() {
