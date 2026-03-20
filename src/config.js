@@ -36,6 +36,7 @@ export const config = {
   deepSeekApiKey: process.env.DEEPSEEK_API_KEY || "",
   deepSeekModel: process.env.DEEPSEEK_MODEL || "deepseek-chat",
   postsPerBatch: Number(process.env.POSTS_PER_BATCH || 20),
+  queueRefillThreshold: Number(process.env.QUEUE_REFILL_THRESHOLD || 0),
   minWords: Number(process.env.MIN_WORDS || 8),
   maxWords: Number(process.env.MAX_WORDS || 12),
   similarityThreshold: Number(process.env.SIMILARITY_THRESHOLD || 0.75),

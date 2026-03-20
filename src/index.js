@@ -35,6 +35,7 @@ import {
 
 const app = express();
 const DASHBOARD_COOKIE = "dashboard_session";
+let queueRefillPromise = null;
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
@@ -257,6 +258,71 @@ async function addPostsToQueue(postTexts) {
 
   syncScheduler();
   return nextState;
+}
+
+async function ensureQueueRefill(reason = "") {
+  if (!config.queueRefillThreshold || config.queueRefillThreshold < 1) {
+    return null;
+  }
+
+  const state = readState();
+  const bot = getBotState(state);
+  if (!bot.active) {
+    return null;
+  }
+
+  if (queueRefillPromise) {
+    return queueRefillPromise;
+  }
+
+  const currentQueued = getQueuedPosts(state).length;
+  if (currentQueued >= config.queueRefillThreshold) {
+    return null;
+  }
+
+  queueRefillPromise = (async () => {
+    let latestState = readState();
+
+    if (isDatabaseConfigured()) {
+      const snapshot = await loadDatabaseSnapshot();
+      if (snapshot) {
+        latestState = updateState((current) => {
+          current.queuedPosts = snapshot.queuedPosts;
+          current.posts = snapshot.posts;
+          current.queueCounter = Math.max(current.queueCounter, snapshot.queueCounter);
+          return current;
+        });
+      }
+    }
+
+    if (getQueuedPosts(latestState).length >= config.queueRefillThreshold) {
+      return latestState;
+    }
+
+    const existingPosts = [
+      ...getQueuedPosts(latestState).map((post) => post.text),
+      ...latestState.posts.slice(-8).map((post) => post.message)
+    ];
+    const generatedPosts = await generatePostsWithDeepSeek({
+      prompt: config.topic,
+      count: config.postsPerBatch,
+      existingPosts
+    });
+    const nextState = await addPostsToQueue(generatedPosts);
+
+    updateState((current) => {
+      current.scheduler.lastResult = `تمت تعبئة الطابور تلقائيًا بـ ${generatedPosts.length} منشور(ات)${reason ? ` - ${reason}` : ""}`;
+      current.scheduler.lastError = "";
+      return current;
+    });
+
+    console.log(`[refill] queued ${generatedPosts.length} posts${reason ? ` (${reason})` : ""}`);
+    return nextState;
+  })().finally(() => {
+    queueRefillPromise = null;
+  });
+
+  return queueRefillPromise;
 }
 
 function renderQueuedPostsList(queuedPosts) {
@@ -575,6 +641,8 @@ async function runPostingJob() {
     return current;
   });
 
+  await ensureQueueRefill("after-publish");
+
   return {
     postId: publishResult.id,
     message: nextPost.text
@@ -593,6 +661,11 @@ function syncScheduler() {
 
   startScheduler(async () => {
     try {
+      await ensureQueueRefill("scheduler");
+      if (!getNextQueuedPost(readState())) {
+        return;
+      }
+
       await runPostingJob();
     } catch (error) {
       updateState((current) => {
@@ -1215,6 +1288,10 @@ app.post("/dashboard/bot-toggle", ensureDashboardAuth, (req, res) => {
 
     syncScheduler();
 
+    if (nextState.bot.active) {
+      void ensureQueueRefill("bot-start");
+    }
+
     if (wantsJson) {
       res.json({
         ok: true,
@@ -1456,13 +1533,18 @@ app.get("/auth/facebook/callback", ensureDashboardAuth, async (req, res) => {
 });
 
 async function maybeRunStartupPost() {
-  const state = readState();
-  const schedule = getScheduleSettings(state);
-  const bot = getBotState(state);
+  let state = readState();
+  let schedule = getScheduleSettings(state);
+  let bot = getBotState(state);
 
   if (!hasDirectPageAccessToken() || !bot.active || !schedule.enabled || getMissingCoreConfig().length) {
     return;
   }
+
+  await ensureQueueRefill("startup");
+  state = readState();
+  schedule = getScheduleSettings(state);
+  bot = getBotState(state);
 
   const lastRunAt = state.scheduler.lastRunAt ? new Date(state.scheduler.lastRunAt).getTime() : 0;
   const minDelayMs = schedule.intervalMinutes * 60 * 1000;

@@ -16,6 +16,7 @@
 - `DATABASE_URL`
 - `DEEPSEEK_API_KEY`
 - `POSTS_PER_BATCH`
+- `QUEUE_REFILL_THRESHOLD`
 - `MIN_WORDS`
 - `MAX_WORDS`
 - `SIMILARITY_THRESHOLD`
@@ -101,6 +102,7 @@ http://localhost:3000
 - سيتم توليد النصوص العربية وإضافتها مباشرة إلى طابور النشر وإلى Postgres
 - يمكن التحكم من Railway أيضًا في:
   - `POSTS_PER_BATCH` لعدد المنشورات الافتراضي
+  - `QUEUE_REFILL_THRESHOLD` لتعبئة الطابور تلقائيًا عندما ينخفض عن حد معين
   - `MIN_WORDS` و `MAX_WORDS` لطول كل منشور
   - `SIMILARITY_THRESHOLD` لتقليل التشابه
   - `TOPIC` و `LANGUAGE` و `STYLE` لتخصيص التوليد
