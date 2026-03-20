@@ -23,9 +23,13 @@ function scheduleNextRun(delayMs) {
   const safeDelayMs = Math.max(250, Number(delayMs || 0));
   nextRunAt = new Date(Date.now() + safeDelayMs).toISOString();
 
-  currentTimer = setTimeout(async () => {
-    if (isRunning) {
-      scheduleNextRun(1000);
+  currentTimer = setInterval(async () => {
+    if (!currentJob || isRunning || !nextRunAt) {
+      return;
+    }
+
+    const dueAt = Date.parse(nextRunAt);
+    if (!Number.isFinite(dueAt) || Date.now() < dueAt) {
       return;
     }
 
@@ -36,10 +40,10 @@ function scheduleNextRun(delayMs) {
     } finally {
       isRunning = false;
       if (currentJob && currentIntervalMs > 0) {
-        scheduleNextRun(currentIntervalMs);
+        nextRunAt = new Date(Date.now() + currentIntervalMs).toISOString();
       }
     }
-  }, safeDelayMs);
+  }, 1000);
 }
 
 export function startScheduler(job, options = {}) {

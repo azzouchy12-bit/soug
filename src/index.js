@@ -485,7 +485,19 @@ async function refreshDirectPageProfile() {
 }
 
 async function runPostingJob() {
-  const state = readState();
+  let state = readState();
+  if (isDatabaseConfigured()) {
+    const snapshot = await loadDatabaseSnapshot();
+    if (snapshot) {
+      state = updateState((current) => {
+        current.queuedPosts = snapshot.queuedPosts;
+        current.posts = snapshot.posts;
+        current.queueCounter = Math.max(current.queueCounter, snapshot.queueCounter);
+        return current;
+      });
+    }
+  }
+
   const connection = getResolvedPageConnection(state);
   const nextPost = getNextQueuedPost(state);
 
