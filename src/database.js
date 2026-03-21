@@ -688,6 +688,30 @@ export async function fetchNextDuePendingCommentReply(nowIso = new Date().toISOS
   return result.rows[0] || null;
 }
 
+export async function fetchDuePendingCommentReplyByCommentId(commentId, nowIso = new Date().toISOString()) {
+  const db = getPool();
+  if (!db) {
+    return null;
+  }
+
+  const result = await db.query(
+    `
+      SELECT
+        comment_id, post_id, author_id, author_name, comment_message,
+        reply_message, market_number, comment_number, status, retry_count, scheduled_for, last_error, created_at
+      FROM pending_comment_replies
+      WHERE comment_id = $1
+        AND status IN ('queued', 'failed')
+        AND scheduled_for <= $2
+      ORDER BY scheduled_for ASC, created_at ASC
+      LIMIT 1
+    `,
+    [commentId, nowIso]
+  );
+
+  return result.rows[0] || null;
+}
+
 export async function fetchNextDuePendingCommentLike(nowIso = new Date().toISOString()) {
   const db = getPool();
   if (!db) {

@@ -8,6 +8,7 @@ import {
   enqueueCommentLike,
   enqueueCommentReply,
   ensureDatabaseSeededFromState,
+  fetchDuePendingCommentReplyByCommentId,
   fetchNextDuePendingCommentLike,
   fetchNextDuePendingCommentReply,
   hasPendingLikeForComment,
@@ -638,8 +639,14 @@ function isIgnorableLikeError(error) {
 }
 
 async function processNextLikeQueueItem(connection) {
+  const emptyResult = {
+    processed: false,
+    ok: false,
+    commentId: ""
+  };
+
   if (!isDatabaseConfigured()) {
-    return false;
+    return emptyResult;
   }
 
   const blockInfo = getBlockInfoForAction("like");
@@ -647,12 +654,39 @@ async function processNextLikeQueueItem(connection) {
     console.log(
       `[like] blocked by configured delay. next_allowed_at=${blockInfo.nextAllowedAt} wait_seconds=${blockInfo.waitSeconds}`
     );
-    return false;
+    return emptyResult;
   }
 
   const nextLike = await fetchNextDuePendingCommentLike(new Date().toISOString());
   if (!nextLike) {
-    return false;
+    return emptyResult;
+  }
+
+  const commentId = String(nextLike.comment_id || "").trim();
+  const pageAccessToken = String(connection.pageAccessToken || "").trim();
+  if (!commentId) {
+    const message = "Missing commentId before like request.";
+    const likeDelaySeconds = getCommentActionSettings().likeDelaySeconds;
+    const scheduledFor = new Date(Date.now() + likeDelaySeconds * 1000).toISOString();
+    await setPendingCommentLikeFailed(nextLike.comment_id, message, scheduledFor);
+    console.error(`[like] failed validation scheduled_for=${scheduledFor} error=${message}`);
+    return {
+      processed: true,
+      ok: false,
+      commentId: ""
+    };
+  }
+  if (!pageAccessToken) {
+    const message = "Missing access token before like request.";
+    const likeDelaySeconds = getCommentActionSettings().likeDelaySeconds;
+    const scheduledFor = new Date(Date.now() + likeDelaySeconds * 1000).toISOString();
+    await setPendingCommentLikeFailed(commentId, message, scheduledFor);
+    console.error(`[like] failed validation comment=${commentId} scheduled_for=${scheduledFor} error=${message}`);
+    return {
+      processed: true,
+      ok: false,
+      commentId
+    };
   }
 
   await setPendingCommentLikeProcessing(nextLike.comment_id);
@@ -663,65 +697,82 @@ async function processNextLikeQueueItem(connection) {
   const startedMs = Date.now();
   try {
     await likeComment({
-      commentId: nextLike.comment_id,
-      pageAccessToken: connection.pageAccessToken
+      commentId,
+      pageAccessToken
     });
-    await markCommentLikeHandled(nextLike.comment_id);
+    await markCommentLikeHandled(commentId);
 
     const likeDelaySeconds = getCommentActionSettings().likeDelaySeconds;
     const nextAllowedAt = setNextAllowedAt("like", likeDelaySeconds, startedMs);
     console.log(
-      `[like] executed comment=${nextLike.comment_id} next_allowed_at=${nextAllowedAt} like_delay_seconds=${likeDelaySeconds}`
+      `[like] executed comment=${commentId} next_allowed_at=${nextAllowedAt} like_delay_seconds=${likeDelaySeconds}`
     );
     updateState((current) => {
-      current.scheduler.lastResult = `تم الإعجاب بالتعليق ${nextLike.comment_id}`;
+      current.scheduler.lastResult = `تم الإعجاب بالتعليق ${commentId}`;
       current.scheduler.lastError = "";
       return current;
     });
+    return {
+      processed: true,
+      ok: true,
+      commentId
+    };
   } catch (error) {
     const message = normalizeErrorMessage(error);
     if (!isIgnorableLikeError(error)) {
       const likeDelaySeconds = getCommentActionSettings().likeDelaySeconds;
       const scheduledFor = new Date(Date.now() + likeDelaySeconds * 1000).toISOString();
-      await setPendingCommentLikeFailed(nextLike.comment_id, message, scheduledFor);
+      await setPendingCommentLikeFailed(commentId, message, scheduledFor);
       setNextAllowedAt("like", likeDelaySeconds);
       console.error(
-        `[like] failed comment=${nextLike.comment_id} scheduled_for=${scheduledFor} like_delay_seconds=${likeDelaySeconds} error=${message}`
+        `[like] failed comment=${commentId} scheduled_for=${scheduledFor} like_delay_seconds=${likeDelaySeconds} error=${message}`
       );
       updateState((current) => {
         current.scheduler.lastError = message;
         return current;
       });
-      return true;
+      return {
+        processed: true,
+        ok: false,
+        commentId
+      };
     }
 
     try {
-      await markCommentLikeHandled(nextLike.comment_id);
+      await markCommentLikeHandled(commentId);
       const likeDelaySeconds = getCommentActionSettings().likeDelaySeconds;
       const nextAllowedAt = setNextAllowedAt("like", likeDelaySeconds, startedMs);
       console.log(
-        `[like] executed (ignorable-error) comment=${nextLike.comment_id} next_allowed_at=${nextAllowedAt} like_delay_seconds=${likeDelaySeconds} raw_error=${message}`
+        `[like] executed (ignorable-error) comment=${commentId} next_allowed_at=${nextAllowedAt} like_delay_seconds=${likeDelaySeconds} raw_error=${message}`
       );
+      return {
+        processed: true,
+        ok: true,
+        commentId
+      };
     } catch (innerError) {
       const innerMessage = normalizeErrorMessage(innerError);
       const likeDelaySeconds = getCommentActionSettings().likeDelaySeconds;
       const scheduledFor = new Date(Date.now() + likeDelaySeconds * 1000).toISOString();
-      await setPendingCommentLikeFailed(nextLike.comment_id, innerMessage, scheduledFor);
+      await setPendingCommentLikeFailed(commentId, innerMessage, scheduledFor);
       setNextAllowedAt("like", likeDelaySeconds);
       console.error(
-        `[like] failed after ignorable-error branch comment=${nextLike.comment_id} scheduled_for=${scheduledFor} error=${innerMessage}`
+        `[like] failed after ignorable-error branch comment=${commentId} scheduled_for=${scheduledFor} error=${innerMessage}`
       );
       updateState((current) => {
         current.scheduler.lastError = innerMessage;
         return current;
       });
+      return {
+        processed: true,
+        ok: false,
+        commentId
+      };
     }
   }
-
-  return true;
 }
 
-async function processNextReplyQueueItem(connection) {
+async function processNextReplyQueueItem(connection, targetCommentId = "") {
   if (!isDatabaseConfigured()) {
     return false;
   }
@@ -734,44 +785,68 @@ async function processNextReplyQueueItem(connection) {
     return false;
   }
 
-  const nextReply = await fetchNextDuePendingCommentReply(new Date().toISOString());
+  const nowIso = new Date().toISOString();
+  const nextReply = targetCommentId
+    ? await fetchDuePendingCommentReplyByCommentId(String(targetCommentId).trim(), nowIso)
+    : await fetchNextDuePendingCommentReply(nowIso);
   if (!nextReply) {
+    if (targetCommentId) {
+      console.log(`[reply] no due queued reply found for liked comment=${targetCommentId}`);
+    }
     return false;
   }
 
-  await setPendingCommentReplyProcessing(nextReply.comment_id);
+  const commentId = String(nextReply.comment_id || "").trim();
+  const pageAccessToken = String(connection.pageAccessToken || "").trim();
+  if (!commentId) {
+    const message = "Missing commentId before reply request.";
+    const replyDelaySeconds = getCommentActionSettings().replyDelaySeconds;
+    const scheduledFor = new Date(Date.now() + replyDelaySeconds * 1000).toISOString();
+    await setPendingCommentReplyFailed(nextReply.comment_id, message, scheduledFor);
+    console.error(`[reply] failed validation scheduled_for=${scheduledFor} error=${message}`);
+    return true;
+  }
+  if (!pageAccessToken) {
+    const message = "Missing access token before reply request.";
+    const replyDelaySeconds = getCommentActionSettings().replyDelaySeconds;
+    const scheduledFor = new Date(Date.now() + replyDelaySeconds * 1000).toISOString();
+    await setPendingCommentReplyFailed(commentId, message, scheduledFor);
+    console.error(`[reply] failed validation comment=${commentId} scheduled_for=${scheduledFor} error=${message}`);
+    return true;
+  }
+
+  await setPendingCommentReplyProcessing(commentId);
   console.log(
-    `[reply] processing comment=${nextReply.comment_id} queued_at=${nextReply.created_at || ""} scheduled_for=${nextReply.scheduled_for || ""}`
+    `[reply] processing comment=${commentId} queued_at=${nextReply.created_at || ""} scheduled_for=${nextReply.scheduled_for || ""}`
   );
 
   const startedMs = Date.now();
   try {
-    const likeHandled = await isLikeHandledForComment(nextReply.comment_id);
+    const likeHandled = await isLikeHandledForComment(commentId);
     if (!likeHandled) {
-      const pendingLike = await hasPendingLikeForComment(nextReply.comment_id);
-      if (pendingLike) {
-        const replyDelaySeconds = getCommentActionSettings().replyDelaySeconds;
-        const deferredTo = new Date(Date.now() + replyDelaySeconds * 1000).toISOString();
-        await deferPendingCommentReply(nextReply.comment_id, deferredTo, "waiting_like_before_reply");
-        console.log(
-          `[reply] deferred comment=${nextReply.comment_id} reason=waiting_like_before_reply scheduled_for=${deferredTo}`
-        );
-        return true;
-      }
+      const pendingLike = await hasPendingLikeForComment(commentId);
+      const reason = pendingLike ? "waiting_like_before_reply" : "missing_like_context_for_reply";
+      const replyDelaySeconds = getCommentActionSettings().replyDelaySeconds;
+      const deferredTo = new Date(Date.now() + replyDelaySeconds * 1000).toISOString();
+      await deferPendingCommentReply(commentId, deferredTo, reason);
+      console.log(
+        `[reply] deferred comment=${commentId} reason=${reason} scheduled_for=${deferredTo}`
+      );
+      return true;
     }
 
     await replyToComment({
-      commentId: nextReply.comment_id,
-      pageAccessToken: connection.pageAccessToken,
+      commentId,
+      pageAccessToken,
       message: nextReply.reply_message
     });
-    await markCommentReplyHandled(nextReply.comment_id);
+    await markCommentReplyHandled(commentId);
 
-    const authorKey = String(nextReply.author_id || nextReply.author_name || `anon:${nextReply.comment_id}`);
+    const authorKey = String(nextReply.author_id || nextReply.author_name || `anon:${commentId}`);
     updateState((current) => {
       current.market.repliedComments = {
         ...(current.market.repliedComments || {}),
-        [nextReply.comment_id]: nextReply.reply_message
+        [commentId]: nextReply.reply_message
       };
       current.market.repliedAuthors = {
         ...(current.market.repliedAuthors || {}),
@@ -788,21 +863,24 @@ async function processNextReplyQueueItem(connection) {
     const replyDelaySeconds = getCommentActionSettings().replyDelaySeconds;
     const nextAllowedAt = setNextAllowedAt("reply", replyDelaySeconds, startedMs);
     console.log(
-      `[reply] executed comment=${nextReply.comment_id} next_allowed_at=${nextAllowedAt} reply_delay_seconds=${replyDelaySeconds}`
+      `[reply] executed comment=${commentId} next_allowed_at=${nextAllowedAt} reply_delay_seconds=${replyDelaySeconds}`
     );
   } catch (error) {
     const message = normalizeErrorMessage(error);
     const replyDelaySeconds = getCommentActionSettings().replyDelaySeconds;
     const scheduledFor = new Date(Date.now() + replyDelaySeconds * 1000).toISOString();
-    await setPendingCommentReplyFailed(nextReply.comment_id, message, scheduledFor);
+    await setPendingCommentReplyFailed(commentId, message, scheduledFor);
     setNextAllowedAt("reply", replyDelaySeconds);
     console.error(
-      `[reply] failed comment=${nextReply.comment_id} scheduled_for=${scheduledFor} reply_delay_seconds=${replyDelaySeconds} error=${message}`
+      `[reply] failed comment=${commentId} scheduled_for=${scheduledFor} reply_delay_seconds=${replyDelaySeconds} error=${message}`
     );
     updateState((current) => {
       current.scheduler.lastError = message;
       return current;
     });
+    if (targetCommentId && commentId === String(targetCommentId).trim()) {
+      console.error(`[reply] like succeeded but reply failed for same comment=${commentId}`);
+    }
   }
 
   return true;
@@ -977,7 +1055,19 @@ function startCommentMonitor() {
       const state = readState();
       const connection = getResolvedPageConnection(state);
       if (getBotState(state).active && connection.pageAccessToken) {
-        await processNextLikeQueueItem(connection);
+        const likeResult = await processNextLikeQueueItem(connection);
+        if (likeResult.processed && !likeResult.ok) {
+          console.log(
+            `[reply] skipped in this cycle because like failed for comment=${likeResult.commentId || "unknown"}`
+          );
+          return;
+        }
+
+        if (likeResult.ok && likeResult.commentId) {
+          await processNextReplyQueueItem(connection, likeResult.commentId);
+          return;
+        }
+
         await processNextReplyQueueItem(connection);
       }
     } catch (error) {
